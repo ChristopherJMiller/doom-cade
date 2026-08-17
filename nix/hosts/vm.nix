@@ -15,6 +15,10 @@
   imports = [
     ../module.nix
     ../kiosk.nix
+    # Thumb-drive IWAD import, same as the cabinet: the VM is where the
+    # import unit/CLI wiring gets exercised (qemu usb-storage can stand in
+    # for a real stick).
+    ../wad-import.nix
   ];
 
   networking.hostName = "doom-cab-vm";
@@ -41,11 +45,15 @@
       memorySize = 4096;
       cores = 4;
       graphics = true;
+      # The run-*-vm script splices these words into its exec line unescaped,
+      # so shell parameter expansion happens at VM start time. Default stays
+      # the interactive GL window (`nix run .#vm`); set ARCADE_VM_DISPLAY to
+      # replace the whole GPU/display stanza, e.g. for a headless test boot
+      # that still gives cage a DRM device (virtio-vga-gl refuses to start
+      # without a GL-capable display, hence plain virtio-vga):
+      #   ARCADE_VM_DISPLAY='-device virtio-vga -display none' run-doom-cab-vm-vm
       qemu.options = [
-        "-device"
-        "virtio-vga-gl"
-        "-display"
-        "gtk,gl=on,show-cursor=off"
+        ''''${ARCADE_VM_DISPLAY:--device virtio-vga-gl -display gtk,gl=on,show-cursor=off}''
       ];
       # ssh -p 2222 doom@localhost
       forwardPorts = [

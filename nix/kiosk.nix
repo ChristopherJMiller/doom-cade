@@ -54,7 +54,14 @@
   # getty.autologinUser above is a fallback if cage ever fails permanently.
   systemd.services."autovt@".enable = false;
 
-  systemd.targets."ctrl-alt-del".enable = false;
+  # Neutralize ctrl-alt-del. `systemd.targets."ctrl-alt-del".enable = false`
+  # cannot work on NixOS: systemd-lib always symlinks ctrl-alt-del.target ->
+  # systemd.ctrlAltDelUnit (non-force ln), so the masked unit collides at
+  # build time. Point the salute at an inert target instead.
+  systemd.targets."arcade-cad-ignore" = {
+    description = "Ignored ctrl-alt-del (kiosk)";
+  };
+  systemd.ctrlAltDelUnit = "arcade-cad-ignore.target";
 
   # No way to escape to a shell from the cabinet itself; SSH with keys only.
   services.openssh = {
