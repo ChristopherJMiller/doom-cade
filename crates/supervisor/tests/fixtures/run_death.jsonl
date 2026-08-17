@@ -1,0 +1,23 @@
+GZDoom g4.12.2 - 2024-06-01 - x86_64-pc-linux-gnu
+M_LoadDefaults: Load system defaults.
+W_Init: Init WADfiles.
+ adding /var/lib/doom-arcade/iwad/doom2.wad, 2919 lumps
+ adding /nix/store/9q7l2v-arcade-telemetry/share/arcade-telemetry.pk3, 6 lumps
+Using video driver wayland
+ARCADE_EVT {"v":1,"event":"run_start","session":"22222222-2222-2222-2222-222222222222","initials":"DIE","skill":3,"ts":1755440000}
+MAP01 - Entryway
+ARCADE_EVT {"v":1,"event":"level_enter","session":"22222222-2222-2222-2222-222222222222","map":"MAP01","level_name":"Entryway","ts":1755440001}
+Picked up the armor.
+ARCADE_EVT {"v":1,"event":"level_complete","session":"22222222-2222-2222-2222-222222222222","map":"MAP01","kills":15,"total_monsters":20,"secrets":0,"total_secrets":1,"items":20,"total_items":36,"maptime_tics":5600}
+MAP02 - Underhalls
+ARCADE_EVT {"v":1,"event":"level_enter","session":"22222222-2222-2222-2222-222222222222","map":"MAP02","level_name":"Underhalls","ts":1755440165}
+ARCADE_EVT {"v":1,"event":"player_died","session":"22222222-2222-2222-2222-2222222
+ARCADE_EVT {"v":1,"event":"run_start","session":"33333333-3333-3333-3333-333333333333","initials":"EVL","skill":3,"ts":1755440200}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"22222222-2222-2222-2222-222222222222","map":"MAP02","kills":38,"total_monsters":45,"secrets":1,"total_secrets":3,"items":22,"total_items":40,"maptime_tics":8400}
+MAP03 - The Gantlet
+ARCADE_EVT {"v":1,"event":"level_enter","session":"22222222-2222-2222-2222-222222222222","map":"MAP03","level_name":"The Gantlet","ts":1755440410}
+Picked up a medikit that you REALLY need!
+ARCADE_EVT {"v":1,"event":"player_died","session":"22222222-2222-2222-2222-222222222222","map":"MAP03","kills":12,"secrets":1,"maptime_tics":2100}
+ARCADE_EVT {"v":1,"event":"player_died","session":"22222222-2222-2222-2222-222222222222","map":"MAP03","kills":12,"secrets":1,"maptime_tics":2100}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"22222222-2222-2222-2222-222222222222","map":"MAP03","kills":58,"total_monsters":58,"secrets":4,"total_secrets":4,"items":50,"total_items":50,"maptime_tics":2200}
+Shutting down sound system

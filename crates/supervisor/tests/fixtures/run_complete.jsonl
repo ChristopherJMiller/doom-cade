@@ -1,0 +1,41 @@
+GZDoom g4.12.2 - 2024-06-01 - x86_64-pc-linux-gnu
+M_LoadDefaults: Load system defaults.
+W_Init: Init WADfiles.
+ adding /var/lib/doom-arcade/iwad/doom2.wad, 2919 lumps
+ adding /nix/store/9q7l2v-arcade-telemetry/share/arcade-telemetry.pk3, 6 lumps
+I_Init: Setting up machine state.
+V_Init: allocate screen.
+S_Init: Setting up sound.
+Using video driver wayland
+ARCADE_EVT {"v":1,"event":"run_start","session":"11111111-1111-1111-1111-111111111111","initials":"ACE","skill":3,"ts":1755430000}
+MAP01 - Entryway
+ARCADE_EVT {"v":1,"event":"level_enter","session":"11111111-1111-1111-1111-111111111111","map":"MAP01","level_name":"Entryway","ts":1755430001}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP0
+ARCADE_EVT this is not json at all
+[log] ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP01","kills":999,"total_monsters":999,"secrets":99,"total_secrets":99,"items":999,"total_items":999,"maptime_tics":1}
+ARCADE_EVT {"v":2,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP01","kills":500,"total_monsters":500,"secrets":50,"total_secrets":50,"items":500,"total_items":500,"maptime_tics":1}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP01","kills":18,"total_monsters":20,"secrets":1,"total_secrets":1,"items":30,"total_items":36,"maptime_tics":4200}
+MAP02 - Underhalls
+ARCADE_EVT {"v":1,"event":"level_enter","session":"11111111-1111-1111-1111-111111111111","map":"MAP02","level_name":"Underhalls","ts":1755430122}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"99999999-9999-9999-9999-999999999999","map":"MAP02","kills":600,"total_monsters":600,"secrets":60,"total_secrets":60,"items":600,"total_items":600,"maptime_tics":35}
+Picked up a shotgun.
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP02","kills":40,"total_monsters":45,"secrets":2,"total_secrets":3,"items":25,"total_items":40,"maptime_tics":7350}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP02","kills":45,"total_monsters":45,"secrets":3,"total_secrets":3,"items":40,"total_items":40,"maptime_tics":7350}
+MAP03 - The Gantlet
+ARCADE_EVT {"v":1,"event":"level_enter","session":"11111111-1111-1111-1111-111111111111","map":"MAP03","level_name":"The Gantlet","ts":1755430340}
+ARCADE_EVT {"v":1,"event":"level_enter","session":"11111111-1111-1111-1111-111111111111","map":"MAP03","level_name":"The Gantlet","ts":1755430340}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP01","kills":777,"total_monsters":777,"secrets":7,"total_secrets":7,"items":777,"total_items":777,"maptime_tics":7}
+Picked up a medikit.
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP03","kills":50,"total_monsters":58,"secrets":0,"total_secrets":4,"items":33,"total_items":50,"maptime_tics":10500}
+MAP07 - Dead Simple
+ARCADE_EVT {"v":1,"event":"level_enter","session":"11111111-1111-1111-1111-111111111111","map":"MAP07","level_name":"Dead Simple","ts":1755430650}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP07","kills":20,"total_monsters":22,"secrets":0,"total_secrets":0,"items":12,"total_items":20,"maptime_tics":5250}
+MAP08 - Tricks and Traps
+ARCADE_EVT {"v":1,"event":"level_enter","session":"11111111-1111-1111-1111-111111111111","map":"MAP08","level_name":"Tricks and Traps","ts":1755430805}
+ARCADE_EVT
+ARCADE_EVT {"v":1,"event":"warp_drive","session":"11111111-1111-1111-1111-111111111111"}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"11111111-1111-1111-1111-111111111111","map":"MAP08","kills":30,"total_monsters":41,"secrets":1,"total_secrets":2,"items":18,"total_items":29,"maptime_tics":9800}
+ARCADE_EVT {"v":1,"event":"run_complete","session":"11111111-1111-1111-1111-111111111111","total_maptime_tics":37100}
+ARCADE_EVT {"v":1,"event":"run_complete","session":"11111111-1111-1111-1111-111111111111","total_maptime_tics":37100}
+ARCADE_EVT {"v":1,"event":"level_enter","session":"11111111-1111-1111-1111-111111111111","map":"MAP09","level_name":"The Pit","ts":1755431110}
+Shutting down sound system
