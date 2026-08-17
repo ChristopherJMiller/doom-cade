@@ -1,0 +1,12 @@
+[package]
+name = "leaderboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arcade-leaderboard"
+path = "src/main.rs"
+
+[dependencies]
+protocol = { workspace = true }

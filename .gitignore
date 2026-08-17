@@ -1,0 +1,14 @@
+# Rust
+/target
+
+# Nix build outputs
+/result
+/result-*
+.direnv/
+
+# IWADs are never committed — provisioned out of band (see docs/SPEC.md §4.2)
+*.wad
+*.WAD
+
+# VM disk images from nixos-rebuild build-vm / nix run .#vm
+*.qcow2
