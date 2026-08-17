@@ -1,0 +1,10 @@
+// SPEC §4.5: session id and player initials, set by the supervisor on the
+// gzdoom command line via "+set arcade_session <uuid> +set arcade_initials
+// <ABC>". Declared 'user' scope so they attach to the player and are
+// settable without any server/cheat gymnastics.
+//
+// Both values are treated as fully untrusted when echoed into telemetry
+// JSON (any player at the console could set them to arbitrary bytes) — see
+// ArcadeTelemetry.JsonEscape in zscript/arcade/handler.zs.
+user string arcade_session = "";
+user string arcade_initials = "";

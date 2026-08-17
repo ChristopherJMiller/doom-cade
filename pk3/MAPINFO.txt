@@ -1,0 +1,83 @@
+// arcade-telemetry MAPINFO (SPEC §4.3): fixed five-map rotation with
+// explicit next chaining, plus event-handler registration.
+//
+// Redefining a map here replaces the engine's stock entry for it entirely,
+// so sky and music are restated to match Doom 2's originals (Freedoom
+// Phase 2 provides the same lump names). Because the redefined maps carry
+// no 'cluster' property, the stock Doom 2 cluster text screens (e.g. the
+// one between MAP06's cluster and MAP07's) never appear — desirable for an
+// arcade run.
+
+gameinfo
+{
+	// ZScript event handlers are not auto-registered by class definition;
+	// this is what activates ArcadeTelemetry. AddEventHandlers (rather than
+	// EventHandlers) appends instead of clobbering any engine defaults.
+	AddEventHandlers = "ArcadeTelemetry"
+}
+
+clearepisodes
+
+episode MAP01
+{
+	name = "Arcade Run"
+	// Skill is locked by the supervisor (-skill 3, SPEC §4.3); never show
+	// a skill picker even if the menu is somehow reached.
+	noskillmenu
+}
+
+defaultmap
+{
+	// Doom 2's city sky, used by all five rotation maps (MAP01–MAP11 share
+	// SKY1 in the stock IWAD).
+	sky1 = "SKY1"
+	// Intermission stays ON (SPEC §4.3 wants the tally screen: it reads as
+	// arcade-appropriate) — deliberately no 'nointermission' here.
+}
+
+map MAP01 lookup "HUSTR_1"
+{
+	next = "MAP02"
+	music = "D_RUNNIN"
+}
+
+map MAP02 lookup "HUSTR_2"
+{
+	next = "MAP03"
+	music = "D_STALKS"
+}
+
+map MAP03 lookup "HUSTR_3"
+{
+	// Rotation skips ahead: MAP03 chains to MAP07, not MAP04.
+	next = "MAP07"
+	music = "D_COUNTD"
+}
+
+map MAP07 lookup "HUSTR_7"
+{
+	next = "MAP08"
+	music = "D_SHAWN"
+	// Dead Simple's arena script: without this the tag-666/667 actions
+	// (walls lower when the Mancubi die, pillars when the Arachnotrons do)
+	// never fire and the map cannot be completed.
+	map07special
+}
+
+map MAP08 lookup "HUSTR_8"
+{
+	// "EndTitle" is the ZDoom-MAPINFO special next value that ends the
+	// game and returns to the title screen — no cast call, no text crawl
+	// ("endtitle" confirmed as a keyword in the pinned 4.14.2 binary).
+	// The supervisor SIGTERMs gzdoom on run_complete anyway; this is what
+	// the engine does if it outlives that by a moment.
+	//
+	// §13.3 resolved: run_complete is emitted from MAP08's WorldUnloaded
+	// (handler.zs), and it was verified live on 4.14.2 that the hook fires
+	// on the real exit into this end sequence with stats intact — no
+	// MAPINFO end-sequence fallback needed (see pk3/NOTES.md). Note the
+	// 'nextmap' CONSOLE command refuses an end-sequence next ("no next
+	// map!"); only real exits (exit lines, Exit_Normal) follow it.
+	next = "EndTitle"
+	music = "D_DDTBLU"
+}

@@ -1,0 +1,36 @@
+// SPEC §4.3: remove save/load from the menu. MENUDEF cannot delete single
+// entries — redefining a menu replaces it wholesale — so the smallest
+// possible override is to restate the two stock main-menu variants (copied
+// from GZDoom 4.14.2's gzdoom.pk3 menudef.txt, Doom branch only) minus the
+// M_LOADG / M_SAVEG // LoadGameMenu / SaveGameMenu entries. ReadThis is
+// dropped too; it has no place on a cabinet. This also covers the in-game
+// pause menu, which is the same "MainMenu".
+//
+// "MainMenuTextOnly" is the variant GZDoom substitutes when localized
+// text menus are active — left unhandled it would resurrect save/load, so
+// it is neutered identically.
+//
+// Defense in depth only: the pristine gzdoom.ini unbinds Esc (SPEC §10),
+// so during a run these menus should be unreachable in the first place.
+//
+// No IfGame guards: this pk3 is only ever loaded with doom2.wad or
+// freedoom2.wad (both Doom-family, both provide the M_* patches).
+
+ListMenu "MainMenu"
+{
+	LineSpacing 16
+	StaticPatch 94, 2, "M_DOOM"
+	Position 97, 72
+	PatchItem "M_NGAME", "n", "PlayerclassMenu"
+	PatchItem "M_OPTION", "o", "OptionsMenu", 0
+	PatchItem "M_QUITG", "q", "QuitMenu", 0
+}
+
+ListMenu "MainMenuTextOnly"
+{
+	StaticPatch 94, 2, "M_DOOM"
+	Position 97, 72
+	TextItem "$MNU_NEWGAME", "n", "PlayerclassMenu"
+	TextItem "$MNU_OPTIONS", "o", "OptionsMenu"
+	TextItem "$MNU_QUITGAME", "q", "QuitMenu"
+}

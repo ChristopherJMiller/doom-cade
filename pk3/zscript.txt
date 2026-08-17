@@ -1,0 +1,10 @@
+// arcade-telemetry ZScript root (SPEC §4.5).
+//
+// Version floor: 4.10. Everything used by the handler (StaticEventHandler,
+// WorldLoaded/WorldUnloaded/WorldThingDied, CVar.GetCVar, String.Format /
+// AppendFormat / ByteAt / Mid, G_SkillPropertyInt, the LevelLocals stat
+// counters) predates 4.10 comfortably. The flake pins GZDoom 4.14.2; the
+// mod compiles clean against that build (see pk3/NOTES.md, §13.2).
+version "4.10"
+
+#include "zscript/arcade/handler.zs"
