@@ -87,11 +87,11 @@ instead of corrupting the existing board (see SPEC §4.2, §6).
 ## Deploying the cabinet
 
 Deployment is GitOps via [comin](https://github.com/nlewo/comin): the cabinet
-polls this repo's `main` branch and rebuilds itself when it changes. Deploying
-a change *is* pushing to `main` — there is no other deploy step. One-time
-setup: replace the placeholder repo URL in `nix/hosts/cabinet.nix` with this
-repo's actual URL so the cabinet knows what to poll. A reboot mid-run is
-acceptable; a reboot mid-attract is invisible.
+polls this repo's `main` branch
+([ChristopherJMiller/doom-cade](https://github.com/ChristopherJMiller/doom-cade),
+configured in `nix/hosts/cabinet.nix`) and rebuilds itself when it changes.
+Deploying a change *is* pushing to `main` — there is no other deploy step.
+A reboot mid-run is acceptable; a reboot mid-attract is invisible.
 
 ## Controls
 

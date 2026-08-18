@@ -51,8 +51,9 @@
     remotes = [
       {
         name = "origin";
-        # TODO: REPLACE-ME with the real repo URL before first deploy.
-        url = "https://github.com/REPLACE-ME/doom-cab.git";
+        # Public repo — comin polls anonymously over https (push access uses
+        # the git@ SSH remote and is not needed here).
+        url = "https://github.com/ChristopherJMiller/doom-cade.git";
         branches.main.name = "main";
       }
     ];
