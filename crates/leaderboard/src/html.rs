@@ -90,7 +90,10 @@ fn fingerprint(season: &Season) -> String {
     let sha = if season.iwad_sha256.is_empty() {
         "NO-IWAD".to_owned()
     } else {
-        season.iwad_sha256.chars().take(8).collect()
+        // Truncate first, THEN escape — the sha is client-supplied text
+        // like every other dynamic field, and truncating after escaping
+        // could split an entity.
+        esc(&season.iwad_sha256.chars().take(8).collect::<String>())
     };
     format!(
         "{sha} &middot; v{} &middot; {}",
@@ -282,4 +285,46 @@ pub fn render(season: &Season, boards: &[Board]) -> String {
     page.push_str(SCRIPT);
     page.push_str("</script></body></html>");
     page
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_escapes_hostile_iwad_sha() {
+        // iwad_sha256 is only length-checked on POST; a markup payload
+        // that becomes the current season must not inject raw HTML into
+        // the footer.
+        let season = Season {
+            iwad_sha256: "<script>".to_owned(),
+            scoring_version: 1,
+            map_rotation_id: "rot-v1".to_owned(),
+        };
+        let fp = fingerprint(&season);
+        assert!(!fp.contains("<script>"), "raw markup leaked: {fp}");
+        assert!(fp.contains("&lt;script&gt;"), "sha not escaped: {fp}");
+
+        let page = render(&season, &[]);
+        assert!(
+            !page.contains("<span id=\"fp-season\"><script>"),
+            "footer carries unescaped markup"
+        );
+    }
+
+    #[test]
+    fn fingerprint_keeps_hex_sha_and_no_iwad_fallback() {
+        let season = Season {
+            iwad_sha256: "feedface0011223344".to_owned(),
+            scoring_version: 1,
+            map_rotation_id: "rot-v1".to_owned(),
+        };
+        assert!(fingerprint(&season).starts_with("feedface &middot;"));
+        let empty = Season {
+            iwad_sha256: String::new(),
+            scoring_version: 1,
+            map_rotation_id: "rot-v1".to_owned(),
+        };
+        assert!(fingerprint(&empty).starts_with("NO-IWAD"));
+    }
 }

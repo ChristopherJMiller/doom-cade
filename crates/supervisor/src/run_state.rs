@@ -22,22 +22,25 @@
 //!   the authoritative initials come from the attract app via the
 //!   constructor; a mismatch is logged.
 //! - **`LevelEnter`** opens a new map entry with zeroed stats. A
-//!   `LevelEnter` for the *same* map while it is already open is a
-//!   duplicate (hook double-fire) and is dropped. A `LevelEnter` for a
-//!   *different* map while one is open means the previous map's
-//!   `LevelComplete` was lost: the open map is closed as **not completed**
-//!   with whatever stats it has (no completion/time bonus is fabricated)
-//!   and the new map opens.
+//!   `LevelEnter` naming *any* map already recorded this run — the open
+//!   one (hook double-fire) or an earlier finalized one (a replayed or
+//!   lagged copy; the rotation never revisits a map within one run) — is
+//!   a duplicate and is dropped without touching the open entry. A
+//!   `LevelEnter` for a genuinely *new* map while one is open means the
+//!   previous map's `LevelComplete` was lost: the open map is closed as
+//!   **not completed** with whatever stats it has (no completion/time
+//!   bonus is fabricated) and the new map opens.
 //! - **`LevelComplete`** finalizes the open map with the event's
 //!   authoritative stats and `completed = true`, but only when the map
 //!   name matches the open entry. If no map is open and the event names
-//!   the most recently finalized map, it is a duplicate and is dropped
-//!   (this is the double-`LevelComplete` case — the second copy, even with
-//!   different stats, cannot double-count or overwrite). If no map is open
-//!   and the name is new, the `LevelEnter` was lost: the event is accepted
-//!   as a complete map entry, since its stats are authoritative. If a
-//!   *different* map is open than the one named, the event is stale and is
-//!   dropped ([`ApplyOutcome::OutOfOrder`]).
+//!   *any* already-recorded map, it is a duplicate and is dropped (this is
+//!   the double-`LevelComplete` case, including a copy delayed past later
+//!   maps — the second copy, even with different stats, cannot
+//!   double-count or overwrite). If no map is open and the name is new,
+//!   the `LevelEnter` was lost: the event is accepted as a complete map
+//!   entry, since its stats are authoritative. If a *different* map is
+//!   open than the one named, the event is stale and is dropped
+//!   ([`ApplyOutcome::OutOfOrder`]).
 //! - **`PlayerDied`** finalizes the current map as **not completed**,
 //!   taking `kills`, `secrets`, and `maptime_tics` from the event
 //!   (authoritative at the moment of death) and keeping items/totals at
@@ -177,11 +180,17 @@ impl RunState {
             }
 
             Event::LevelEnter { map, .. } => {
+                // Any already-recorded map — the open one (hook
+                // double-fire) or an earlier finalized one (a replayed or
+                // lagged copy) — is a duplicate: the rotation never
+                // revisits a map within one run, so re-opening it could
+                // only double-count.
+                if self.maps.iter().any(|m| m.map == *map) {
+                    debug!(map = %map, "level_enter for an already-recorded map; dropping");
+                    return ApplyOutcome::Duplicate;
+                }
                 if self.open {
                     let current = self.maps.last().expect("open implies a last map");
-                    if current.map == *map {
-                        return ApplyOutcome::Duplicate;
-                    }
                     // Lost LevelComplete: close the previous map without
                     // fabricating any bonus.
                     warn!(
@@ -235,8 +244,11 @@ impl RunState {
                         );
                         ApplyOutcome::OutOfOrder
                     }
-                } else if self.maps.last().is_some_and(|m| m.map == *map) {
-                    // The double-LevelComplete case: already finalized.
+                } else if self.maps.iter().any(|m| m.map == *map) {
+                    // The double-LevelComplete case: already finalized —
+                    // whether it was the most recent map or one further
+                    // back (a copy delayed past later maps must not be
+                    // accepted as a fresh entry and double-count).
                     ApplyOutcome::Duplicate
                 } else {
                     // Lost LevelEnter: the stats are authoritative, so the
@@ -633,6 +645,46 @@ mod tests {
         let sub = finish(s, EndReason::Abandoned);
         assert_eq!(sub.maps.len(), 2);
         assert_eq!(sub.maps[0].kills, 10);
+    }
+
+    #[test]
+    fn replayed_level_complete_for_earlier_map_is_dropped() {
+        // A duplicate level_complete for a map OTHER than the most recent
+        // one (e.g. a lagged copy of MAP01's completion arriving after
+        // MAP02 finished) must not be accepted as a fresh entry.
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&complete("MAP01", 10, 0, 0, 350));
+        s.apply(&enter("MAP02"));
+        s.apply(&complete("MAP02", 20, 0, 0, 350));
+        assert_eq!(
+            s.apply(&complete("MAP01", 10, 0, 0, 350)),
+            ApplyOutcome::Duplicate
+        );
+        let sub = finish(s, EndReason::Abandoned);
+        assert_eq!(sub.maps.len(), 2, "MAP01 must not appear twice");
+        assert_eq!(sub.kills, 30, "kills must not double-count");
+        assert_eq!(sub.maps_completed, 2);
+    }
+
+    #[test]
+    fn replayed_level_enter_for_earlier_map_is_dropped() {
+        // A lagged copy of an earlier map's level_enter must neither close
+        // the currently open map nor re-open the old one.
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&complete("MAP01", 10, 0, 0, 350));
+        s.apply(&enter("MAP02"));
+        assert_eq!(s.apply(&enter("MAP01")), ApplyOutcome::Duplicate);
+        // MAP02 is still the open map and completes normally.
+        assert_eq!(
+            s.apply(&complete("MAP02", 5, 0, 0, 350)),
+            ApplyOutcome::Applied
+        );
+        let sub = finish(s, EndReason::Abandoned);
+        assert_eq!(sub.maps.len(), 2);
+        assert!(sub.maps[1].completed);
+        assert_eq!(sub.maps_completed, 2);
     }
 
     #[test]

@@ -72,8 +72,17 @@ let
         echo "doom-arcade-import-wad: verified and installed doom2.wad ($actual)"
       fi
 
-      # Take effect immediately. Ignore failure on hosts without the kiosk.
-      systemctl restart doom-arcade-preflight.service cage-tty1.service || true
+      # Take effect immediately. A direct `systemctl restart` would be
+      # denied by polkit for the unprivileged doom SSH user, so the restart
+      # lives in a root oneshot unit (doom-arcade-apply-wad.service) that a
+      # polkit rule below lets doom start. Never silently swallowed: if the
+      # restart cannot happen, say so instead of claiming success.
+      if systemctl start doom-arcade-apply-wad.service; then
+        echo "doom-arcade-import-wad: kiosk restarted; the new IWAD is live"
+      else
+        echo "doom-arcade-import-wad: WARNING: could not restart the kiosk" >&2
+        echo "doom-arcade-import-wad: the new IWAD takes effect on the next reboot" >&2
+      fi
     '';
   };
 
@@ -143,6 +152,37 @@ in
         ExecStart = "${wadImportUdev}/bin/doom-arcade-wad-import %i";
       };
     };
+
+    # Privileged apply step for a freshly imported IWAD. The import script
+    # runs unprivileged over SSH (user doom), which polkit rightly stops
+    # from restarting arbitrary units — so the exact restart it needs is
+    # packaged as a root oneshot that doom is allowed to start (rule below).
+    systemd.services.doom-arcade-apply-wad = {
+      description = "Apply a newly imported IWAD (re-verify and restart the kiosk)";
+      path = [ pkgs.systemd ];
+      serviceConfig.Type = "oneshot";
+      script = ''
+        systemctl restart doom-arcade-preflight.service
+        # Hosts without the kiosk just refresh the preflight env file.
+        if systemctl cat cage-tty1.service >/dev/null 2>&1; then
+          systemctl restart cage-tty1.service
+        fi
+      '';
+    };
+
+    security.polkit.enable = true;
+    security.polkit.extraConfig = ''
+      // Allow the doom user (the only SSH identity on the cabinet) to start
+      // exactly the IWAD apply unit — nothing else.
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.freedesktop.systemd1.manage-units" &&
+            subject.user == "doom" &&
+            action.lookup("unit") == "doom-arcade-apply-wad.service" &&
+            action.lookup("verb") == "start") {
+          return polkit.Result.YES;
+        }
+      });
+    '';
 
     environment.systemPackages = [ importWad ];
   };

@@ -3,11 +3,15 @@
 //! A single tokio task that, on every [`kick`](Submitter::kick) and every
 //! 60 seconds regardless, POSTs pending spool rows to the leaderboard's
 //! `POST /v1/runs`, oldest first. A 2xx — including the 200 the service
-//! returns for an idempotent duplicate — marks the row submitted. Any
-//! failure is recorded on the row and retried with exponential backoff:
-//! 5 s doubling to a 5 min cap, reset on success. One failing run does
-//! not starve the rest: every pending row is attempted each pass, and the
-//! backoff applies between passes.
+//! returns for an idempotent duplicate — marks the row submitted. A
+//! *transient* failure (network trouble, 5xx, 408/429) is recorded on the
+//! row and retried with exponential backoff: 5 s doubling to a 5 min cap,
+//! reset on success. A *permanent* rejection (any other 4xx, e.g. a
+//! validation 422 — re-POSTing the identical payload can never succeed)
+//! quarantines the row via [`Spool::mark_failed`] so it stops consuming
+//! the server's per-cabinet rate-limit budget and cannot starve newer
+//! runs forever. One failing run does not starve the rest: every pending
+//! row is attempted each pass, and the backoff applies between passes.
 //!
 //! HTTP is done with `ureq` inside `spawn_blocking` rather than a full
 //! async client: the leaderboard lives on the same machine or LAN over
@@ -118,7 +122,19 @@ async fn run(spool: Arc<Spool>, cfg: SubmitterConfig, notify: Arc<Notify>) {
                         }
                         backoff = BACKOFF_BASE;
                     }
-                    Ok(Err(err)) => {
+                    Ok(Err(PostError::Permanent(err))) => {
+                        // Retrying an identical payload cannot succeed;
+                        // quarantine it so it stops burning rate-limit
+                        // budget and blocking newer runs (kept on disk
+                        // for inspection).
+                        warn!(session = %run.session, attempts = run.attempts + 1,
+                              "submission permanently rejected; quarantining: {err}");
+                        if let Err(db_err) = spool.mark_failed(&run.session, &err) {
+                            error!(session = %run.session, "quarantining run: {db_err:#}");
+                            any_failure = true;
+                        }
+                    }
+                    Ok(Err(PostError::Transient(err))) => {
                         warn!(session = %run.session, attempts = run.attempts + 1,
                               "submission failed: {err}");
                         if let Err(db_err) = spool.record_failure(&run.session, &err) {
@@ -170,10 +186,29 @@ fn read_token(path: &Path) -> Option<String> {
     }
 }
 
+/// How a submission attempt failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostError {
+    /// The server rejected this payload outright (a 4xx other than
+    /// 408/429): re-POSTing the identical bytes can never succeed, so the
+    /// row must be quarantined instead of retried forever.
+    Permanent(String),
+    /// Anything else — network trouble, 5xx, timeout (408), rate limit
+    /// (429): worth retrying later.
+    Transient(String),
+}
+
+/// Whether an HTTP status is a permanent rejection of this payload.
+/// 408 (timeout) and 429 (rate limit) are about the *moment*, not the
+/// payload; every other 4xx condemns the payload itself.
+fn is_permanent_status(status: u16) -> bool {
+    (400..500).contains(&status) && status != 408 && status != 429
+}
+
 /// POSTs one payload; `Ok(status)` on any 2xx (a 200 for an idempotent
-/// duplicate counts as success), `Err(description)` otherwise. Blocking —
+/// duplicate counts as success), `Err(PostError)` otherwise. Blocking —
 /// call from `spawn_blocking` only.
-fn post_run(url: &str, token: Option<&str>, payload: &str) -> Result<u16, String> {
+fn post_run(url: &str, token: Option<&str>, payload: &str) -> Result<u16, PostError> {
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     let mut request = agent.post(url).set("Content-Type", "application/json");
     if let Some(token) = token {
@@ -184,8 +219,10 @@ fn post_run(url: &str, token: Option<&str>, payload: &str) -> Result<u16, String
             let status = response.status();
             if (200..300).contains(&status) {
                 Ok(status)
+            } else if is_permanent_status(status) {
+                Err(PostError::Permanent(format!("unexpected status {status}")))
             } else {
-                Err(format!("unexpected status {status}"))
+                Err(PostError::Transient(format!("unexpected status {status}")))
             }
         }
         Err(ureq::Error::Status(code, response)) => {
@@ -195,9 +232,14 @@ fn post_run(url: &str, token: Option<&str>, payload: &str) -> Result<u16, String
                 .chars()
                 .take(200)
                 .collect();
-            Err(format!("http {code}: {body}"))
+            let msg = format!("http {code}: {body}");
+            if is_permanent_status(code) {
+                Err(PostError::Permanent(msg))
+            } else {
+                Err(PostError::Transient(msg))
+            }
         }
-        Err(err) => Err(format!("transport error: {err}")),
+        Err(err) => Err(PostError::Transient(format!("transport error: {err}"))),
     }
 }
 
@@ -235,6 +277,64 @@ mod tests {
         for base in ["http://127.0.0.1:8080", "http://127.0.0.1:8080/"] {
             let url = format!("{}/v1/runs", base.trim_end_matches('/'));
             assert_eq!(url, "http://127.0.0.1:8080/v1/runs");
+        }
+    }
+
+    #[test]
+    fn permanent_status_classification() {
+        for permanent in [400, 401, 403, 404, 409, 422] {
+            assert!(is_permanent_status(permanent), "{permanent}");
+        }
+        for transient in [408, 429, 500, 502, 503, 504] {
+            assert!(!is_permanent_status(transient), "{transient}");
+        }
+    }
+
+    /// Serves exactly one connection with a canned HTTP status, on a
+    /// background thread, returning the URL to POST to.
+    fn one_shot_server(status_line: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            // Drain the request headers (enough for ureq to accept the
+            // response as belonging to its request).
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{addr}/v1/runs")
+    }
+
+    #[test]
+    fn post_run_classifies_422_as_permanent() {
+        // The poison-row scenario: a validation 422 must be a permanent
+        // rejection (quarantined), not retried forever.
+        let url = one_shot_server("422 Unprocessable Entity");
+        match post_run(&url, None, "{}") {
+            Err(PostError::Permanent(msg)) => assert!(msg.contains("422"), "{msg}"),
+            other => panic!("expected permanent rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_run_classifies_5xx_and_429_as_transient() {
+        let url = one_shot_server("503 Service Unavailable");
+        match post_run(&url, None, "{}") {
+            Err(PostError::Transient(msg)) => assert!(msg.contains("503"), "{msg}"),
+            other => panic!("expected transient failure, got {other:?}"),
+        }
+        let url = one_shot_server("429 Too Many Requests");
+        match post_run(&url, None, "{}") {
+            Err(PostError::Transient(msg)) => assert!(msg.contains("429"), "{msg}"),
+            other => panic!("expected transient failure, got {other:?}"),
         }
     }
 }

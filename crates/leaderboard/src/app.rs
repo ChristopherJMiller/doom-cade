@@ -39,8 +39,27 @@ const MAX_MAPS: usize = 16;
 const MAX_STRING: usize = 64;
 /// Per-cabinet POST rate limit: this many requests per window.
 const RATE_LIMIT_MAX: usize = 10;
+/// Global POST rate limit across all cabinets per window. The cabinet_id
+/// key comes from the request body, so on its own the per-cabinet limit is
+/// bypassable by minting fresh ids; this cap bounds the total POST volume
+/// regardless of the claimed cabinet.
+const GLOBAL_RATE_LIMIT_MAX: usize = 60;
 /// Rate-limit window.
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// Hard cap on distinct cabinet keys retained by the rate limiter, so a
+/// client rotating cabinet_id values cannot grow the map without bound.
+const RATE_KEYS_MAX: usize = 1024;
+/// Tolerated forward clock skew on a submission's `ended_at`.
+const MAX_ENDED_AT_SKEW: time::Duration = time::Duration::minutes(5);
+
+/// Sliding-window request logs behind [`AppState::rate_check`].
+#[derive(Default)]
+struct RateState {
+    /// Per-cabinet request log.
+    per_cabinet: HashMap<String, Vec<Instant>>,
+    /// All-cabinets request log for the global cap.
+    global: Vec<Instant>,
+}
 
 /// Shared application state.
 pub struct AppState {
@@ -48,8 +67,12 @@ pub struct AppState {
     pub pool: SqlitePool,
     /// Bearer token required on `POST /v1/runs`; `None` = open (dev mode).
     pub token: Option<String>,
-    /// Per-cabinet sliding-window request log for rate limiting.
-    rate: Mutex<HashMap<String, Vec<Instant>>>,
+    /// Sliding-window request logs for rate limiting.
+    rate: Mutex<RateState>,
+    /// [`GLOBAL_RATE_LIMIT_MAX`], overridable in tests.
+    global_rate_max: usize,
+    /// [`RATE_KEYS_MAX`], overridable in tests.
+    rate_keys_max: usize,
 }
 
 impl AppState {
@@ -58,20 +81,54 @@ impl AppState {
         AppState {
             pool,
             token,
-            rate: Mutex::new(HashMap::new()),
+            rate: Mutex::new(RateState::default()),
+            global_rate_max: GLOBAL_RATE_LIMIT_MAX,
+            rate_keys_max: RATE_KEYS_MAX,
         }
     }
 
+    /// Overrides the rate-limiter bounds so tests can exercise them
+    /// without thousands of requests.
+    #[cfg(test)]
+    fn with_rate_bounds(mut self, global_max: usize, keys_max: usize) -> Self {
+        self.global_rate_max = global_max;
+        self.rate_keys_max = keys_max;
+        self
+    }
+
     /// Records a POST from `cabinet_id`; returns `false` when over budget.
+    ///
+    /// Three bounds, in order: the global request budget (cabinet_id is
+    /// client-supplied, so per-key budgets alone are mintable), the cap on
+    /// distinct keys (evicting keys idle for a full window first, so the
+    /// map cannot grow without bound), and the per-cabinet budget.
     fn rate_check(&self, cabinet_id: &str) -> bool {
         let now = Instant::now();
-        let mut map = self.rate.lock().expect("rate limiter poisoned");
-        let log = map.entry(cabinet_id.to_owned()).or_default();
+        let mut rate = self.rate.lock().expect("rate limiter poisoned");
+        let rate = &mut *rate;
+        rate.global
+            .retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
+        if rate.global.len() >= self.global_rate_max {
+            return false;
+        }
+        if !rate.per_cabinet.contains_key(cabinet_id)
+            && rate.per_cabinet.len() >= self.rate_keys_max
+        {
+            rate.per_cabinet.retain(|_, log| {
+                log.last()
+                    .is_some_and(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW)
+            });
+            if rate.per_cabinet.len() >= self.rate_keys_max {
+                return false;
+            }
+        }
+        let log = rate.per_cabinet.entry(cabinet_id.to_owned()).or_default();
         log.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
         if log.len() >= RATE_LIMIT_MAX {
             return false;
         }
         log.push(now);
+        rate.global.push(now);
         true
     }
 }
@@ -177,10 +234,9 @@ fn check_str(field: &str, value: &str, max: usize, required: bool) -> Result<(),
     Ok(())
 }
 
-fn check_rfc3339(field: &str, value: &str) -> Result<(), ApiError> {
+fn check_rfc3339(field: &str, value: &str) -> Result<OffsetDateTime, ApiError> {
     OffsetDateTime::parse(value, &Rfc3339)
-        .map_err(|_| ApiError::unprocessable(format!("{field} is not an RFC 3339 timestamp")))?;
-    Ok(())
+        .map_err(|_| ApiError::unprocessable(format!("{field} is not an RFC 3339 timestamp")))
 }
 
 /// Full server-side validation of a submission (SPEC §7.3): shape and size
@@ -198,8 +254,28 @@ fn validate(sub: &RunSubmission) -> Result<(), ApiError> {
     check_str("map_rotation_id", &sub.map_rotation_id, MAX_STRING, true)?;
     check_str("started_at", &sub.started_at, MAX_STRING, true)?;
     check_str("ended_at", &sub.ended_at, MAX_STRING, true)?;
-    check_rfc3339("started_at", &sub.started_at)?;
-    check_rfc3339("ended_at", &sub.ended_at)?;
+    let started_at = check_rfc3339("started_at", &sub.started_at)?;
+    let ended_at = check_rfc3339("ended_at", &sub.ended_at)?;
+    // Timestamps are client-supplied: bound them so a far-future ended_at
+    // cannot poison anything ordered or filtered by it.
+    if started_at > ended_at {
+        return Err(ApiError::unprocessable("started_at is after ended_at"));
+    }
+    if ended_at > OffsetDateTime::now_utc() + MAX_ENDED_AT_SKEW {
+        return Err(ApiError::unprocessable("ended_at is in the future"));
+    }
+    // The scoring formula below is this binary's only formula: a
+    // submission scored under any other version cannot be validated (or
+    // ranked) here, so reject it distinctly instead of failing the score
+    // recomputation with a misleading mismatch. This is a permanent
+    // (non-retryable) rejection for the submitting cabinet.
+    if sub.scoring_version != protocol::SCORING_VERSION {
+        return Err(ApiError::unprocessable(format!(
+            "unsupported scoring_version {} (this server validates only version {})",
+            sub.scoring_version,
+            protocol::SCORING_VERSION
+        )));
+    }
 
     if sub.maps.len() > MAX_MAPS {
         return Err(ApiError::unprocessable(format!(
@@ -284,13 +360,17 @@ fn validate(sub: &RunSubmission) -> Result<(), ApiError> {
         }
     }
 
-    if sub.end_reason == EndReason::Complete {
-        let all_completed = !sub.maps.is_empty() && sub.maps.iter().all(|m| m.completed);
-        if !all_completed {
-            return Err(ApiError::unprocessable(
-                "end_reason is \"complete\" but not every map was completed",
-            ));
-        }
+    // The supervisor's state machine deliberately emits end_reason
+    // "complete" with a not-completed map row when a level_complete line
+    // was lost in telemetry (its documented lossy-FIFO leniency), so that
+    // shape must be accepted — rejecting it would make the client's own
+    // tolerated states unsubmittable and lose the run forever. Only the
+    // fully-empty shape (complete with no map rows at all) is implausible
+    // enough to reject.
+    if sub.end_reason == EndReason::Complete && sub.maps.is_empty() {
+        return Err(ApiError::unprocessable(
+            "end_reason is \"complete\" but no maps were recorded",
+        ));
     }
 
     let recomputed = sub.recompute_score();
@@ -420,4 +500,52 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, ApiEr
         .await
         .map_err(ApiError::internal)?;
     Ok(Html(html::render(&season, &boards)))
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+    use crate::db;
+
+    async fn state(global_max: usize, keys_max: usize) -> AppState {
+        let pool = db::open(":memory:").await.expect("open :memory:");
+        AppState::new(pool, None).with_rate_bounds(global_max, keys_max)
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_key_count_is_bounded() {
+        // Distinct cabinet_ids are attacker-mintable; the key map must
+        // stay bounded instead of growing until OOM.
+        let s = state(10_000, 4).await;
+        for key in ["a", "b", "c", "d"] {
+            assert!(s.rate_check(key), "key {key} within the key cap");
+        }
+        // A fifth fresh key while all four are live inside the window:
+        // rejected rather than inserted.
+        assert!(
+            !s.rate_check("e"),
+            "fresh key past the cap must be rejected"
+        );
+        // Existing keys keep their budget, and the map stayed bounded.
+        assert!(s.rate_check("a"));
+        let rate = s.rate.lock().unwrap();
+        assert!(rate.per_cabinet.len() <= 4);
+    }
+
+    #[tokio::test]
+    async fn global_budget_bounds_rotating_cabinet_ids() {
+        // Rotating cabinet_id used to mint a fresh 10/min budget per
+        // request; the global cap bounds the flood regardless of key.
+        let s = state(5, 1_000).await;
+        for i in 0..5 {
+            assert!(
+                s.rate_check(&format!("cab-{i}")),
+                "request {i} within the global budget"
+            );
+        }
+        assert!(
+            !s.rate_check("cab-fresh"),
+            "a fresh cabinet_id must not bypass the global budget"
+        );
+    }
 }

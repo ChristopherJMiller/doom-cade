@@ -10,6 +10,8 @@ use protocol::{
     map_score, run_score, Board, BoardCategory, BoardsResponse, EndReason, MapResult, MapStats,
     RunSubmission, MAP_ROTATION, MAP_ROTATION_ID, SCORING_VERSION, TICS_PER_SECOND,
 };
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tower::ServiceExt;
 
 use crate::app::{self, AppState};
@@ -23,12 +25,14 @@ async fn test_app(token: Option<&str>) -> Router {
 }
 
 /// Builds an internally consistent submission from per-map
-/// `(kills, secrets, seconds, completed)` tuples.
+/// `(kills, secrets, seconds, completed)` tuples. Timestamps are relative
+/// to now (`ended_at = now - ended_ago_secs`, 15-minute run) so they pass
+/// the server's not-in-the-future validation whenever the tests run.
 fn run_with(
     session: &str,
     initials: &str,
     cabinet: &str,
-    ended_at: &str,
+    ended_ago_secs: i64,
     end_reason: EndReason,
     maps: &[(i64, i64, i64, bool)],
 ) -> RunSubmission {
@@ -64,12 +68,14 @@ fn run_with(
             map_score: map_score(s),
         })
         .collect();
+    let ended = OffsetDateTime::now_utc() - time::Duration::seconds(ended_ago_secs);
+    let started = ended - time::Duration::minutes(15);
     RunSubmission {
         session: session.to_owned(),
         initials: initials.to_owned(),
         cabinet_id: cabinet.to_owned(),
-        started_at: "2026-08-17T12:00:00Z".to_owned(),
-        ended_at: ended_at.to_owned(),
+        started_at: started.format(&Rfc3339).expect("format started_at"),
+        ended_at: ended.format(&Rfc3339).expect("format ended_at"),
         end_reason,
         maps_completed: stats.iter().filter(|s| s.completed).count() as i64,
         kills: stats.iter().map(|s| s.kills).sum(),
@@ -143,7 +149,7 @@ async fn idempotent_double_submit() {
         "s-idem",
         "ABC",
         "cab-1",
-        "2026-08-17T12:10:00Z",
+        600,
         EndReason::Death,
         &[(50, 2, 200, true), (12, 1, 60, false)],
     );
@@ -164,7 +170,7 @@ async fn idempotent_double_submit() {
         "s-idem",
         "ZZZ",
         "cab-1",
-        "2026-08-17T12:10:00Z",
+        600,
         EndReason::Death,
         &[(50, 2, 200, true), (12, 1, 60, false)],
     );
@@ -191,7 +197,7 @@ async fn score_mismatch_is_422() {
         "s-cheat",
         "ABC",
         "cab-1",
-        "2026-08-17T12:10:00Z",
+        600,
         EndReason::Death,
         &[(50, 2, 200, false)],
     );
@@ -213,7 +219,7 @@ async fn bad_initials_is_422() {
             "s-bad-ini",
             bad,
             "cab-1",
-            "2026-08-17T12:10:00Z",
+            600,
             EndReason::Death,
             &[(1, 0, 10, false)],
         );
@@ -230,7 +236,7 @@ async fn implausible_values_are_422() {
             session,
             "ABC",
             "cab-1",
-            "2026-08-17T12:10:00Z",
+            600,
             EndReason::Death,
             &[(10, 1, 60, true), (5, 0, 30, false)],
         )
@@ -268,17 +274,187 @@ async fn implausible_values_are_422() {
         "aggregate mismatch"
     );
 
-    // end_reason complete without completing every map.
+    // end_reason complete with no map rows at all.
     let mut sub = base("s-endr");
     sub.end_reason = EndReason::Complete;
-    let (status, _) = send(&app, post_run(&sub, None)).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "bogus complete");
+    sub.maps.clear();
+    sub.maps_completed = 0;
+    sub.kills = 0;
+    sub.secrets = 0;
+    sub.items = 0;
+    sub.total_tics = 0;
+    sub.run_score = 0;
+    let (status, body) = send(&app, post_run(&sub, None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "empty complete");
+    let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(err["error"].as_str().unwrap().contains("no maps"));
 
     // Oversized cabinet_id.
     let mut sub = base("s-size");
     sub.cabinet_id = "x".repeat(65);
     let (status, _) = send(&app, post_run(&sub, None)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "oversized string");
+}
+
+/// The supervisor deliberately emits end_reason "complete" with an
+/// incomplete map row when a level_complete telemetry line is lost; the
+/// server must accept that shape or the run is 422-rejected forever and
+/// the score silently lost.
+#[tokio::test]
+async fn complete_with_incomplete_map_is_accepted() {
+    let app = test_app(None).await;
+    // Full clear, but MAP03's level_complete line was lost: closed as
+    // not completed, run still ends in run_complete.
+    let sub = run_with(
+        "s-lossy-complete",
+        "LCY",
+        "cab-1",
+        600,
+        EndReason::Complete,
+        &[
+            (20, 1, 120, true),
+            (20, 1, 120, true),
+            (20, 1, 120, false),
+            (20, 1, 120, true),
+            (20, 1, 120, true),
+        ],
+    );
+    let (status, body) = send(&app, post_run(&sub, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    // The run actually lands on the board.
+    let (status, body) = get_boards(&app, "/v1/boards").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: BoardsResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        initials_of(board_by(&resp, BoardCategory::HighScore)),
+        ["LCY"]
+    );
+    assert_eq!(board_by(&resp, BoardCategory::Deepest).entries[0].value, 4);
+}
+
+/// A submission scored under a different SCORING_VERSION cannot be
+/// validated by this binary's formula: it must be rejected distinctly, not
+/// fail the recompute with a misleading "run_score mismatch".
+#[tokio::test]
+async fn wrong_scoring_version_is_422() {
+    let app = test_app(None).await;
+    let mut sub = run_with(
+        "s-scorever",
+        "ABC",
+        "cab-1",
+        600,
+        EndReason::Death,
+        &[(10, 1, 60, true)],
+    );
+    sub.scoring_version = SCORING_VERSION + 1;
+    let (status, body) = send(&app, post_run(&sub, None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported scoring_version"),
+        "distinct error expected, got {err}"
+    );
+}
+
+/// Client-supplied timestamps are bounded: no far-future ended_at, no
+/// ended_at before started_at.
+#[tokio::test]
+async fn client_timestamps_are_bounded() {
+    let app = test_app(None).await;
+
+    let mut sub = run_with(
+        "s-future",
+        "ABC",
+        "cab-1",
+        600,
+        EndReason::Death,
+        &[(1, 0, 10, false)],
+    );
+    sub.ended_at = "9999-01-01T00:00:00Z".to_owned();
+    let (status, body) = send(&app, post_run(&sub, None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "future ended_at");
+    let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(err["error"].as_str().unwrap().contains("future"));
+
+    let mut sub = run_with(
+        "s-reversed",
+        "ABC",
+        "cab-1",
+        600,
+        EndReason::Death,
+        &[(1, 0, 10, false)],
+    );
+    std::mem::swap(&mut sub.started_at, &mut sub.ended_at);
+    let (status, _) = send(&app, post_run(&sub, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "started_at after ended_at"
+    );
+}
+
+/// The default season follows server-side arrival order, and a forged
+/// far-future ended_at cannot hijack it (it is rejected outright; even the
+/// ordering no longer trusts ended_at).
+#[tokio::test]
+async fn current_season_ignores_forged_ended_at() {
+    let app = test_app(None).await;
+    // An older-played run under a different season arrives first...
+    let mut other = run_with(
+        "s-other-season",
+        "OLD",
+        "cab-1",
+        10 * 3600,
+        EndReason::Death,
+        &[(1, 0, 10, false)],
+    );
+    other.iwad_sha256 = "otherwad".to_owned();
+    let (status, _) = send(&app, post_run(&other, None)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // ...then a legit run under the real season arrives (played more
+    // recently or not — arrival order is what counts).
+    let legit = run_with(
+        "s-legit",
+        "ABC",
+        "cab-1",
+        600,
+        EndReason::Death,
+        &[(10, 1, 60, true)],
+    );
+    let (status, _) = send(&app, post_run(&legit, None)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A hijack attempt with a far-future ended_at is rejected...
+    let mut hijack = run_with(
+        "s-hijack",
+        "EVL",
+        "cab-1",
+        600,
+        EndReason::Death,
+        &[(1, 0, 10, false)],
+    );
+    hijack.iwad_sha256 = "hijackwad".to_owned();
+    hijack.ended_at = "9999-01-01T00:00:00Z".to_owned();
+    let (status, _) = send(&app, post_run(&hijack, None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // ...and the default season is the most recently RECEIVED run's.
+    let (status, body) = get_boards(&app, "/v1/boards").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: BoardsResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resp.season.iwad_sha256, IWAD);
+    assert_eq!(
+        initials_of(board_by(&resp, BoardCategory::HighScore)),
+        ["ABC"]
+    );
 }
 
 #[tokio::test]
@@ -288,7 +464,7 @@ async fn auth_enforced_when_token_configured() {
         "s-auth",
         "ABC",
         "cab-1",
-        "2026-08-17T12:10:00Z",
+        600,
         EndReason::Death,
         &[(1, 0, 10, false)],
     );
@@ -322,7 +498,7 @@ async fn seeded_ordering_app() -> Router {
             "s-aaa",
             "AAA",
             "cab-1",
-            "2026-08-17T13:00:00Z",
+            3 * 3600,
             EndReason::Complete,
             &[(20, 1, 120, true); 5],
         ),
@@ -330,7 +506,7 @@ async fn seeded_ordering_app() -> Router {
             "s-bbb",
             "BBB",
             "cab-1",
-            "2026-08-17T14:00:00Z",
+            2 * 3600,
             EndReason::Complete,
             &[(10, 0, 100, true); 5],
         ),
@@ -338,7 +514,7 @@ async fn seeded_ordering_app() -> Router {
             "s-ccc",
             "CCC",
             "cab-1",
-            "2026-08-17T15:00:00Z",
+            3600,
             EndReason::Death,
             &[(30, 2, 300, true), (30, 2, 300, true), (15, 1, 100, false)],
         ),
@@ -443,7 +619,7 @@ async fn per_cabinet_rate_limit_is_429() {
             &format!("s-rl-{i}"),
             "RRR",
             "cab-flood",
-            "2026-08-17T12:10:00Z",
+            600,
             EndReason::Death,
             &[(1, 0, 10, false)],
         );
@@ -454,7 +630,7 @@ async fn per_cabinet_rate_limit_is_429() {
         "s-rl-over",
         "RRR",
         "cab-flood",
-        "2026-08-17T12:10:00Z",
+        600,
         EndReason::Death,
         &[(1, 0, 10, false)],
     );
@@ -467,6 +643,36 @@ async fn per_cabinet_rate_limit_is_429() {
     other.cabinet_id = "cab-other".to_owned();
     let (status, _) = send(&app, post_run(&other, None)).await;
     assert_eq!(status, StatusCode::CREATED);
+}
+
+/// Rotating cabinet_id (an attacker-chosen field) must not mint unlimited
+/// fresh per-cabinet budgets: the global cap bounds the flood.
+#[tokio::test]
+async fn rotating_cabinet_ids_hit_the_global_rate_limit() {
+    let app = test_app(None).await;
+    for i in 0..60 {
+        let sub = run_with(
+            &format!("s-grl-{i}"),
+            "GGG",
+            &format!("cab-mint-{i}"),
+            600,
+            EndReason::Death,
+            &[(1, 0, 10, false)],
+        );
+        let (status, _) = send(&app, post_run(&sub, None)).await;
+        assert_eq!(status, StatusCode::CREATED, "request {i} within budget");
+    }
+    // Request 61 with yet another fresh cabinet_id: globally throttled.
+    let sub = run_with(
+        "s-grl-over",
+        "GGG",
+        "cab-mint-over",
+        600,
+        EndReason::Death,
+        &[(1, 0, 10, false)],
+    );
+    let (status, _) = send(&app, post_run(&sub, None)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

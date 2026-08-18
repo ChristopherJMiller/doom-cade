@@ -153,6 +153,38 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions =
+      let
+        listenHost = lib.head (lib.splitString ":" cfg.leaderboard.listen);
+        firewallOpen = cfg.leaderboard.enable && cfg.leaderboard.openFirewall;
+      in
+      [
+        {
+          # SPEC §7.3: POST /v1/runs carries a shared bearer token. Without
+          # one, opening the firewall exposes an unauthenticated write
+          # endpoint: any LAN host could POST forged runs.
+          assertion = !firewallOpen || cfg.leaderboard.tokenFile != null;
+          message = ''
+            services.doom-arcade.leaderboard.openFirewall = true requires
+            leaderboard.tokenFile — otherwise POST /v1/runs would accept
+            unauthenticated score submissions from the whole LAN.
+          '';
+        }
+        {
+          # openFirewall punches the port, but the service still binds the
+          # listen address verbatim; on loopback the hole is useless and the
+          # failure looks like a firewall problem.
+          assertion = !firewallOpen || !(lib.elem listenHost [ "127.0.0.1" "localhost" "::1" "[::1]" ]);
+          message = ''
+            services.doom-arcade.leaderboard.openFirewall = true opens port
+            ${toString leaderboardPort}, but leaderboard.listen
+            ("${cfg.leaderboard.listen}") binds loopback, so LAN connections
+            would be refused anyway. Set leaderboard.listen to a
+            non-loopback address (e.g. "0.0.0.0:8080").
+          '';
+        }
+      ];
+
     users.users.doom = {
       isNormalUser = true;
       group = "doom";

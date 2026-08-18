@@ -234,13 +234,17 @@ pub async fn fetch_run(pool: &SqlitePool, session: &str) -> Result<Option<RunSub
     }))
 }
 
-/// The current season: the season triple of the most recent run (by
-/// `ended_at`). With no runs at all, falls back to an empty IWAD hash and
-/// this build's scoring/rotation constants so the response shape is stable.
+/// The current season: the season triple of the most recently *received*
+/// run — ordered by `id`, i.e. server-side arrival order, never by the
+/// client-supplied `ended_at` (one run with a forged far-future timestamp
+/// would otherwise hijack the default season for every viewer until its
+/// row was deleted by hand). With no runs at all, falls back to an empty
+/// IWAD hash and this build's scoring/rotation constants so the response
+/// shape is stable.
 pub async fn current_season(pool: &SqlitePool) -> Result<Season> {
     let row = sqlx::query(
         "SELECT iwad_sha256, scoring_version, map_rotation_id
-         FROM runs ORDER BY ended_at DESC, id DESC LIMIT 1",
+         FROM runs ORDER BY id DESC LIMIT 1",
     )
     .fetch_optional(pool)
     .await?;

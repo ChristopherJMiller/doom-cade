@@ -15,9 +15,15 @@
 //!   created_at   TEXT NOT NULL,      -- RFC 3339, when spooled
 //!   submitted_at TEXT,               -- RFC 3339, NULL until a 2xx
 //!   attempts     INTEGER NOT NULL DEFAULT 0,
-//!   last_error   TEXT
+//!   last_error   TEXT,
+//!   failed_at    TEXT                -- RFC 3339, set on permanent rejection
 //! );
 //! ```
+//!
+//! A row with `failed_at` set was permanently rejected by the server (a
+//! non-retryable 4xx such as a validation 422): it is excluded from
+//! [`Spool::pending`] so it cannot burn the rate-limit budget forever and
+//! starve newer runs, but it is kept on disk for operator inspection.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -35,7 +41,8 @@ CREATE TABLE IF NOT EXISTS spooled_runs (
   created_at   TEXT NOT NULL,
   submitted_at TEXT,
   attempts     INTEGER NOT NULL DEFAULT 0,
-  last_error   TEXT
+  last_error   TEXT,
+  failed_at    TEXT
 );
 ";
 
@@ -65,6 +72,9 @@ pub struct SpoolEntry {
     pub attempts: i64,
     /// The most recent submission error, if any.
     pub last_error: Option<String>,
+    /// When the run was permanently rejected by the leaderboard, if it
+    /// was. Set rows no longer appear in [`Spool::pending`].
+    pub failed_at: Option<String>,
 }
 
 /// Handle to the spool database. `Send + Sync` (the connection sits behind
@@ -95,6 +105,20 @@ impl Spool {
             .context("setting journal_mode")?;
         conn.execute_batch(SCHEMA)
             .context("applying spool schema")?;
+        // Migration for spools created before the failed_at column existed
+        // (CREATE TABLE IF NOT EXISTS does not extend an existing table).
+        let has_failed_at: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('spooled_runs')
+                 WHERE name = 'failed_at'",
+                [],
+                |row| row.get(0),
+            )
+            .context("inspecting spool schema")?;
+        if has_failed_at == 0 {
+            conn.execute("ALTER TABLE spooled_runs ADD COLUMN failed_at TEXT", [])
+                .context("adding failed_at column")?;
+        }
         Ok(Spool {
             conn: Mutex::new(conn),
         })
@@ -120,12 +144,14 @@ impl Spool {
     /// All runs not yet submitted, oldest first (insertion order — `rowid`
     /// breaks ties within one `created_at` second, and RFC 3339 strings
     /// with mixed sub-second precision do not sort reliably on their own).
+    /// Permanently rejected rows (`failed_at` set) are excluded, so they
+    /// cannot starve newer runs of the server's rate-limit budget.
     pub fn pending(&self) -> anyhow::Result<Vec<PendingRun>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT session, payload, attempts FROM spooled_runs
-                 WHERE submitted_at IS NULL
+                 WHERE submitted_at IS NULL AND failed_at IS NULL
                  ORDER BY created_at ASC, rowid ASC",
             )
             .context("preparing pending query")?;
@@ -172,11 +198,27 @@ impl Spool {
         Ok(())
     }
 
+    /// Quarantines a permanently rejected run: bumps `attempts`, stores
+    /// the (truncated) rejection, and sets `failed_at` so the row leaves
+    /// [`Spool::pending`]. The row itself is kept for inspection.
+    pub fn mark_failed(&self, session: &str, error: &str) -> anyhow::Result<()> {
+        let error: String = error.chars().take(500).collect();
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE spooled_runs
+             SET attempts = attempts + 1, last_error = ?2, failed_at = ?3
+             WHERE session = ?1",
+            params![session, error, now_rfc3339()],
+        )
+        .context("marking run permanently failed")?;
+        Ok(())
+    }
+
     /// Fetches one full row, for tests and debugging.
     pub fn entry(&self, session: &str) -> anyhow::Result<Option<SpoolEntry>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT session, payload, created_at, submitted_at, attempts, last_error
+            "SELECT session, payload, created_at, submitted_at, attempts, last_error, failed_at
              FROM spooled_runs WHERE session = ?1",
             params![session],
             |row| {
@@ -187,6 +229,7 @@ impl Spool {
                     submitted_at: row.get(3)?,
                     attempts: row.get(4)?,
                     last_error: row.get(5)?,
+                    failed_at: row.get(6)?,
                 })
             },
         )
@@ -327,6 +370,64 @@ mod tests {
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0].session, "s-persist");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_failed_quarantines_row_but_keeps_it() {
+        let spool = spool();
+        spool.insert_run(&submission("s-poison")).unwrap();
+        spool.insert_run(&submission("s-good")).unwrap();
+        spool
+            .mark_failed("s-poison", "http 422: end_reason mismatch")
+            .unwrap();
+        // The poisoned row leaves pending — it can no longer starve
+        // newer runs — but stays on disk for inspection.
+        let pending = spool.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].session, "s-good");
+        let entry = spool.entry("s-poison").unwrap().unwrap();
+        assert!(entry.failed_at.is_some());
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(
+            entry.last_error.as_deref(),
+            Some("http 422: end_reason mismatch")
+        );
+        assert!(entry.submitted_at.is_none());
+    }
+
+    #[test]
+    fn opens_spool_created_before_failed_at_column() {
+        // A spool written by an older supervisor lacks failed_at; opening
+        // it must migrate the schema, not fail or mis-read rows.
+        let dir = std::env::temp_dir().join(format!("spool-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("spool.sqlite");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE spooled_runs (
+                   session      TEXT PRIMARY KEY,
+                   payload      TEXT NOT NULL,
+                   created_at   TEXT NOT NULL,
+                   submitted_at TEXT,
+                   attempts     INTEGER NOT NULL DEFAULT 0,
+                   last_error   TEXT
+                 );
+                 INSERT INTO spooled_runs (session, payload, created_at)
+                 VALUES ('s-old', '{}', '2026-08-17T12:00:00Z');",
+            )
+            .unwrap();
+        }
+        let spool = Spool::open(&db).unwrap();
+        let pending = spool.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].session, "s-old");
+        let entry = spool.entry("s-old").unwrap().unwrap();
+        assert_eq!(entry.failed_at, None);
+        // The migrated column is fully functional.
+        spool.mark_failed("s-old", "http 422: poison").unwrap();
+        assert!(spool.pending().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

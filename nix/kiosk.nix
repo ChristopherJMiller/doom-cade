@@ -26,9 +26,18 @@
     user = "doom";
     program = lib.mkDefault "${config.services.doom-arcade.package}/bin/arcade-supervisor";
   };
-  systemd.services."cage-tty1".serviceConfig = {
-    Restart = "always";
-    RestartSec = 2;
+  systemd.services."cage-tty1" = {
+    serviceConfig = {
+      Restart = "always";
+      RestartSec = 2;
+    };
+    # The upstream cage module ships restartIfChanged = false, which makes
+    # comin self-update (SPEC §9) silently inert for the kiosk payload: a
+    # switched-in generation would leave the old supervisor/attract/
+    # gzdoom/pk3 store paths running until a power cycle. Force restarts on
+    # unit change — the cabinet is an unattended appliance, so a deploy
+    # interrupting an in-progress game is the accepted trade-off.
+    restartIfChanged = lib.mkForce true;
   };
 
   boot.loader.timeout = 0;

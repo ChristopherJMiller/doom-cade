@@ -17,7 +17,13 @@
 //! 3. Spawn gzdoom with the exact SPEC §8.2 argument vector (plus dev-mode
 //!    extras) and read **both** the FIFO and the child's stdout line by
 //!    line, concurrently — whichever transport the pinned GZDoom build
-//!    actually uses (SPEC §13.1), the events arrive.
+//!    actually uses (SPEC §13.1), the events arrive. The pinned build
+//!    mirrors the same `ARCADE_EVT` lines to both (pk3/NOTES.md): the FIFO
+//!    delivers in real time while piped stdout is block-buffered and lags.
+//!    So the first event parsed from the FIFO latches it as the telemetry
+//!    transport; from then on stdout telemetry is ignored (it is the same
+//!    stream, arriving late — applying both would double-count maps).
+//!    Stdout lines still count as liveness for the watchdog.
 //! 4. Feed every line through [`protocol::parse_event_line`] into
 //!    [`RunState`]. On `player_died`: SIGTERM after 3 s (death-animation
 //!    linger), SIGKILL 10 s later if it ignored the SIGTERM. On
@@ -39,9 +45,9 @@ use anyhow::Context as _;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
 use nix::unistd::Pid;
-use protocol::{parse_event_line, EndReason, Event};
+use protocol::{parse_event_line, EndReason, Event, MAX_EVENT_LINE_BYTES};
 use time::OffsetDateTime;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufReader, Lines};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufReader};
 use tokio::net::unix::pipe;
 use tokio::process::Command;
 use tokio::sync::oneshot;
@@ -123,13 +129,14 @@ pub async fn run_session(
         let _ = exit_tx.send(status);
     });
 
-    let mut fifo_lines = BufReader::new(fifo).lines();
-    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut fifo_lines = CappedLines::new(BufReader::new(fifo));
+    let mut stdout_lines = CappedLines::new(BufReader::new(stdout));
     let mut fifo_open = true;
     let mut stdout_open = true;
     let mut pump = EventPump {
         state: RunState::new(session_id, initials, &cfg.cabinet_id, &cfg.iwad_sha256),
         pid,
+        fifo_latched: false,
         term_at: None,
         kill_at: None,
         watchdog_at: Instant::now() + WATCHDOG_TIMEOUT,
@@ -233,6 +240,13 @@ pub async fn run_session(
 struct EventPump {
     state: RunState,
     pid: Pid,
+    /// Set once any telemetry event has parsed from the FIFO. The pinned
+    /// GZDoom mirrors the same `ARCADE_EVT` lines to stdout, block-buffered
+    /// and lagged (pk3/NOTES.md §13.1) — once the FIFO is known live,
+    /// stdout copies are stale duplicates and must not reach the state
+    /// machine (a lagged enter+complete block replayed cross-stream would
+    /// double-count a map). Stdout stays a watchdog liveness source.
+    fifo_latched: bool,
     /// When to send SIGTERM (armed by a terminal event or the watchdog).
     term_at: Option<Instant>,
     /// When to escalate to SIGKILL.
@@ -243,7 +257,9 @@ struct EventPump {
 
 impl EventPump {
     /// Handles one line from either stream: feeds the watchdog, parses,
-    /// applies, and arms the kill timers on terminal events.
+    /// applies, and arms the kill timers on terminal events. Telemetry on
+    /// stdout is dropped once the FIFO has delivered any event (see
+    /// [`EventPump::fifo_latched`]).
     fn on_line(&mut self, source: &'static str, line: &str) {
         // ANY line is proof of life, event or not (SPEC §8.4).
         self.watchdog_at = Instant::now() + WATCHDOG_TIMEOUT;
@@ -251,6 +267,15 @@ impl EventPump {
         let Some(event) = parse_event_line(line) else {
             return;
         };
+        if source == "fifo" {
+            self.fifo_latched = true;
+        } else if self.fifo_latched {
+            debug!(
+                ?event,
+                "ignoring stdout telemetry; fifo is the live transport"
+            );
+            return;
+        }
         match self.state.apply(&event) {
             ApplyOutcome::Applied => match &event {
                 Event::PlayerDied { map, .. } => {
@@ -275,12 +300,99 @@ impl EventPump {
 /// Reads lines until the stream stays quiet for [`DRAIN_QUIET`], hits
 /// EOF, or errors. Used after child exit, when no more producers exist.
 async fn drain_lines<R: AsyncBufRead + Unpin>(
-    lines: &mut Lines<R>,
+    lines: &mut CappedLines<R>,
     source: &'static str,
     pump: &mut EventPump,
 ) {
     while let Ok(Ok(Some(line))) = tokio::time::timeout(DRAIN_QUIET, lines.next_line()).await {
         pump.on_line(source, &line);
+    }
+}
+
+/// Line reader with a hard per-line memory cap.
+///
+/// `tokio`'s `Lines::next_line` buffers an entire line before returning,
+/// so [`protocol::MAX_EVENT_LINE_BYTES`] — checked only inside
+/// [`parse_event_line`], i.e. after the line is fully resident — could
+/// never bound memory: a newline-less byte stream on the FIFO or stdout
+/// (wedged engine, runaway mod printing without line breaks) would grow
+/// the supervisor's memory until the OOM killer took down the kiosk's one
+/// long-lived process. This reader enforces the cap while reading: once a
+/// line exceeds the cap it is dropped (one warning), remaining bytes are
+/// discarded in bounded chunks until the next `\n`, and reading resumes.
+///
+/// `next_line` is cancel-safe (required by the `tokio::select!` pump):
+/// partial-line state lives in `self` across `.await`s, and bytes are
+/// `consume`d synchronously right after being copied out of `fill_buf`.
+struct CappedLines<R> {
+    reader: R,
+    buf: Vec<u8>,
+    /// True while discarding an oversized line's remainder up to `\n`.
+    discarding: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> CappedLines<R> {
+    fn new(reader: R) -> Self {
+        CappedLines {
+            reader,
+            buf: Vec::new(),
+            discarding: false,
+        }
+    }
+
+    /// Returns the next newline-terminated line (lossy UTF-8, without the
+    /// terminator; a trailing `\r` is stripped), the final unterminated
+    /// line at EOF, or `None` at EOF.
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // EOF. A partial oversized line was already dropped.
+                self.discarding = false;
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                let line = String::from_utf8_lossy(&self.buf).into_owned();
+                self.buf.clear();
+                return Ok(Some(line));
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    if !self.discarding {
+                        self.buf.extend_from_slice(&available[..pos]);
+                    }
+                    self.reader.consume(pos + 1);
+                    if self.discarding {
+                        // Oversized line fully skipped; resync on the
+                        // next line.
+                        self.discarding = false;
+                        continue;
+                    }
+                    if self.buf.last() == Some(&b'\r') {
+                        self.buf.pop();
+                    }
+                    let line = String::from_utf8_lossy(&self.buf).into_owned();
+                    self.buf.clear();
+                    return Ok(Some(line));
+                }
+                None => {
+                    let n = available.len();
+                    if !self.discarding {
+                        self.buf.extend_from_slice(available);
+                    }
+                    self.reader.consume(n);
+                    if self.buf.len() > MAX_EVENT_LINE_BYTES {
+                        warn!(
+                            bytes = self.buf.len(),
+                            "dropping oversized line (no newline within the cap)"
+                        );
+                        self.buf.clear();
+                        self.buf.shrink_to_fit();
+                        self.discarding = true;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -343,5 +455,162 @@ fn send_signal(pid: Pid, signal: Signal) {
     match kill(pid, signal) {
         Ok(()) => debug!(%pid, ?signal, "signal sent"),
         Err(err) => debug!(%pid, ?signal, %err, "signal not delivered"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::format_event_line;
+    use time::macros::datetime;
+
+    const SESSION: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn pump() -> EventPump {
+        EventPump {
+            state: RunState::new(SESSION, "ABC", "cab-test", "sha-test"),
+            pid: Pid::from_raw(0),
+            fifo_latched: false,
+            term_at: None,
+            kill_at: None,
+            watchdog_at: Instant::now() + WATCHDOG_TIMEOUT,
+        }
+    }
+
+    fn enter(map: &str) -> String {
+        format_event_line(&Event::LevelEnter {
+            session: SESSION.into(),
+            map: map.into(),
+            level_name: map.into(),
+            ts: 0,
+        })
+    }
+
+    fn complete(map: &str, kills: i64, tics: i64) -> String {
+        format_event_line(&Event::LevelComplete {
+            session: SESSION.into(),
+            map: map.into(),
+            kills,
+            total_monsters: kills + 5,
+            secrets: 0,
+            total_secrets: 0,
+            items: 0,
+            total_items: 0,
+            maptime_tics: tics,
+        })
+    }
+
+    fn run_complete() -> String {
+        format_event_line(&Event::RunComplete {
+            session: SESSION.into(),
+            total_maptime_tics: 7000,
+        })
+    }
+
+    fn finish(pump: EventPump) -> protocol::RunSubmission {
+        let reason = pump.state.terminal_reason().unwrap_or(EndReason::Abandoned);
+        pump.state
+            .finish(
+                reason,
+                datetime!(2026-08-17 12:00:00 UTC),
+                datetime!(2026-08-17 12:15:00 UTC),
+            )
+            .submission
+    }
+
+    /// The dual-transport failure scenario: the FIFO delivers events in
+    /// real time while gzdoom's pipe-buffered stdout later flushes a stale
+    /// block containing copies of the same events. Once the FIFO has
+    /// latched, stdout telemetry must not reach the state machine.
+    #[test]
+    fn stale_stdout_telemetry_is_ignored_once_fifo_latches() {
+        let mut p = pump();
+        // FIFO delivers promptly: enter/complete MAP01, enter MAP02.
+        p.on_line("fifo", &enter("MAP01"));
+        p.on_line("fifo", &complete("MAP01", 10, 3500));
+        p.on_line("fifo", &enter("MAP02"));
+        // Stdout's ~4KB block flush arrives late with its stale copies.
+        p.on_line("stdout", &enter("MAP01"));
+        p.on_line("stdout", &complete("MAP01", 10, 3500));
+        // A stdout-only event never seen on the FIFO must ALSO be dropped
+        // (proves the gate is per-transport, not just per-content dedupe).
+        p.on_line("stdout", &complete("MAP07", 99, 100));
+        // The run finishes over the FIFO.
+        p.on_line("fifo", &complete("MAP02", 20, 3500));
+        p.on_line("fifo", &run_complete());
+
+        assert_eq!(p.state.terminal_reason(), Some(EndReason::Complete));
+        let sub = finish(p);
+        let names: Vec<&str> = sub.maps.iter().map(|m| m.map.as_str()).collect();
+        assert_eq!(names, ["MAP01", "MAP02"], "no map may be double-counted");
+        assert!(
+            sub.maps.iter().all(|m| m.completed),
+            "MAP02 must not be closed incomplete by the stale stdout block"
+        );
+        assert_eq!(sub.maps_completed, 2);
+        assert_eq!(sub.kills, 30, "kills must not double-count");
+    }
+
+    /// The stdout fallback transport still works when the FIFO never
+    /// produces telemetry (e.g. `-logfile` unsupported): only parsed FIFO
+    /// events latch, not chatter.
+    #[test]
+    fn stdout_telemetry_applies_while_fifo_is_silent() {
+        let mut p = pump();
+        p.on_line("fifo", "Init: DOOM 2: Hell on Earth"); // chatter: no latch
+        p.on_line("stdout", &enter("MAP01"));
+        p.on_line("stdout", &complete("MAP01", 10, 3500));
+        let sub = finish(p);
+        assert_eq!(sub.maps.len(), 1);
+        assert_eq!(sub.maps_completed, 1);
+        assert_eq!(sub.kills, 10);
+    }
+
+    async fn collect_lines(data: &[u8]) -> Vec<String> {
+        let mut lines = CappedLines::new(BufReader::new(data));
+        let mut out = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("read") {
+            out.push(line);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn capped_lines_drops_oversized_line_and_resyncs() {
+        let huge = "x".repeat(MAX_EVENT_LINE_BYTES * 3);
+        let data = format!("before\n{huge}\nafter\r\n");
+        assert_eq!(collect_lines(data.as_bytes()).await, ["before", "after"]);
+    }
+
+    #[tokio::test]
+    async fn capped_lines_passes_lines_at_the_cap() {
+        // Exactly MAX_EVENT_LINE_BYTES must still get through, so the
+        // parser cap stays the effective limit.
+        let at_cap = "y".repeat(MAX_EVENT_LINE_BYTES);
+        let data = format!("{at_cap}\nnext\n");
+        let lines = collect_lines(data.as_bytes()).await;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), MAX_EVENT_LINE_BYTES);
+        assert_eq!(lines[1], "next");
+    }
+
+    #[tokio::test]
+    async fn capped_lines_bounds_memory_on_newline_free_stream() {
+        // A multi-cap newline-less stream (the OOM scenario): yields no
+        // line and the accumulation buffer never outgrows the cap by more
+        // than one refill chunk.
+        let data = vec![b'z'; MAX_EVENT_LINE_BYTES * 4];
+        let mut lines = CappedLines::new(BufReader::new(&data[..]));
+        assert_eq!(lines.next_line().await.expect("read"), None);
+        assert!(
+            lines.buf.capacity() <= MAX_EVENT_LINE_BYTES + 8192,
+            "line buffer grew to {} bytes",
+            lines.buf.capacity()
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_lines_returns_final_unterminated_line() {
+        assert_eq!(collect_lines(b"tail-no-newline").await, ["tail-no-newline"]);
     }
 }

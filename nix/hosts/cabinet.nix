@@ -59,6 +59,18 @@
     ];
   };
 
+  # Comin adds a full system closure per merged commit but never collects
+  # garbage (it only unlinks stale profiles), so an unattended cabinet's
+  # /nix grows until builds fail with ENOSPC and self-update dies silently.
+  # Reclaim regularly and keep the ESP bounded too.
+  nix.gc = {
+    automatic = true;
+    dates = "weekly";
+    options = "--delete-older-than 14d";
+  };
+  nix.optimise.automatic = true;
+  boot.loader.systemd-boot.configurationLimit = 5;
+
   # ---------------------------------------------------------------------------
   # Impermanence: tmpfs root, state survives only in /persist (SPEC §9).
   environment.persistence."/persist" = {
