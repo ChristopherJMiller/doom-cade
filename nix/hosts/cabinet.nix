@@ -1,12 +1,13 @@
 # The physical cabinet.
 #
-# `comin` and `impermanence` arrive via specialArgs from flake.nix.
+# `comin`, `impermanence`, and `disko` arrive via specialArgs from flake.nix.
 {
   config,
   lib,
   pkgs,
   comin,
   impermanence,
+  disko,
   ...
 }:
 
@@ -15,8 +16,11 @@
     ../module.nix
     ../kiosk.nix
     ../wad-import.nix
+    ../wifi-import.nix
+    ../disk-layout.nix
     impermanence.nixosModules.impermanence
     comin.nixosModules.comin
+    disko.nixosModules.disko
   ];
 
   networking.hostName = "doom-cab";
@@ -29,16 +33,50 @@
     # the Freedoom fallback) with the UNVERIFIED banner.
     iwadSha256 = null;
     cabinetId = "cab-1";
-    # Local leaderboard. Point .url at another host instead if the
-    # leaderboard moves off-cabinet (e.g. the k8s cluster), and disable this.
-    leaderboard.enable = true;
+    # Local leaderboard, browsable from the office subnet: the attract
+    # screen shows the URL (LAN IP, auto-detected). GET is open; POST is
+    # protected by a locally-minted token, satisfying the module's
+    # openFirewall assertions. Point .url at another host instead if the
+    # leaderboard ever moves off-cabinet.
+    leaderboard = {
+      enable = true;
+      listen = "0.0.0.0:8080";
+      url = "http://127.0.0.1:8080"; # what supervisor/attract talk to
+      openFirewall = true;
+      generateToken = true;
+    };
+  };
+
+  # mDNS convenience alias: http://doom-cab.local:8080 where the office
+  # network allows multicast DNS (the numeric IP on the attract screen is
+  # the universal fallback).
+  services.avahi = {
+    enable = true;
+    publish = {
+      enable = true;
+      addresses = true;
+    };
   };
 
   # TODO: replace with your actual public key(s). PasswordAuthentication is
   # off (kiosk.nix) — without a key here the machine is SSH-inaccessible.
   users.users.doom.openssh.authorizedKeys.keys = [
-    # "ssh-ed25519 AAAA... you@laptop"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICHR4q3amhKDhCF6+xa3oTXJX2ycN503+cEo/gpnOkFt git@chrismiller.xyz"
   ];
+
+  # ---------------------------------------------------------------------------
+  # Networking: NetworkManager, so Wi-Fi profiles created on the installer
+  # stick (nmtui) carry over — doom-cade-install copies them into
+  # /persist/etc/NetworkManager/system-connections, and the persistence bind
+  # below puts them back under /etc every boot. Wired DHCP still works under
+  # NM. This lives here rather than kiosk.nix because it is physical-cabinet
+  # plumbing; the dev VM keeps its default qemu networking.
+  networking.networkmanager.enable = true;
+  # Powersave trades Wi-Fi latency/reliability for milliwatts — the wrong
+  # trade for a plugged-in cabinet.
+  networking.networkmanager.wifi.powersave = false;
+  # Lets an SSH'd `doom` session run nmcli/nmtui to change networks later.
+  users.users.doom.extraGroups = [ "networkmanager" ];
 
   # ---------------------------------------------------------------------------
   # GitOps self-update: comin polls the repo and switches to what main builds.
@@ -77,53 +115,38 @@
     hideMounts = true;
     directories = [
       "/var/lib/doom-arcade" # IWAD + score spool (+ local leaderboard DB)
-      "/etc/ssh"             # host keys
       "/var/lib/comin"       # comin's deployment state (state.json etc.)
       "/var/lib/nixos"       # uid/gid maps — keeps doom's uid stable
+      "/etc/NetworkManager/system-connections" # Wi-Fi profiles (installer carry-over + nmtui edits)
     ];
     files = [
       "/etc/machine-id"
     ];
   };
 
-  # ===========================================================================
-  # PLACEHOLDER DISK LAYOUT — REPLACE ON THE REAL MACHINE.
-  #
-  # On the physical cabinet:
-  #   1. Partition: ESP (vfat, label BOOT), /nix (ext4, label nix),
-  #      /persist (ext4, label persist). Root is tmpfs.
-  #   2. Run `nixos-generate-config --root /mnt` and paste the generated
-  #      hardware section (bus IDs, initrd kernel modules, cpu microcode)
-  #      here or into a hardware-configuration.nix imported here.
-  #   3. Keep root on tmpfs and keep neededForBoot on /persist, otherwise
-  #      impermanence cannot bind things in before services start.
-  # ===========================================================================
-  fileSystems."/" = {
-    device = "none";
-    fsType = "tmpfs";
-    options = [
-      "defaults"
-      "size=2G"
-      "mode=755"
-    ];
-  };
-  fileSystems."/nix" = {
-    device = "/dev/disk/by-label/nix"; # PLACEHOLDER
-    fsType = "ext4";
-    neededForBoot = true;
-  };
-  fileSystems."/persist" = {
-    device = "/dev/disk/by-label/persist"; # PLACEHOLDER
-    fsType = "ext4";
-    neededForBoot = true;
-  };
-  fileSystems."/boot" = {
-    device = "/dev/disk/by-label/BOOT"; # PLACEHOLDER
-    fsType = "vfat";
-  };
+  # SSH host keys live in /persist directly (sshd_config points there) rather
+  # than behind an impermanence bind. A directory bind on /etc/ssh would
+  # shadow the store-symlinked sshd_config — sshd then fails to start with
+  # "No such file or directory" (found by the QEMU install test) — and
+  # file binds race ssh-keygen with empty placeholder files.
+  services.openssh.hostKeys = [
+    {
+      path = "/persist/etc/ssh/ssh_host_ed25519_key";
+      type = "ed25519";
+    }
+    {
+      path = "/persist/etc/ssh/ssh_host_rsa_key";
+      type = "rsa";
+      bits = 4096;
+    }
+  ];
+
+  # Disk layout is declarative via disko (../disk-layout.nix): tmpfs root,
+  # 1G ESP, btrfs `nix`/`persist` subvolumes. Override the device at install
+  # time with `disko-install --disk main /dev/X` (the installer ISO's
+  # `doom-cade-install` prompts for it) — nothing hardware-specific here.
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
-  # ===========================================================================
 
   system.stateVersion = "26.05";
 }

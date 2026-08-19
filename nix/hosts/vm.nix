@@ -19,6 +19,9 @@
     # import unit/CLI wiring gets exercised (qemu usb-storage can stand in
     # for a real stick).
     ../wad-import.nix
+    # Thumb-drive Wi-Fi import, ditto — no NetworkManager or radio in the
+    # VM, so only the mount/find/degrade paths get exercised here.
+    ../wifi-import.nix
   ];
 
   networking.hostName = "doom-cab-vm";
@@ -30,6 +33,9 @@
     iwadSha256 = null;
     cabinetId = "vm";
     leaderboard.enable = true;
+    # The guest's own IP is NAT-internal and useless to the host; show the
+    # forwarded port instead (see forwardPorts below).
+    publicUrl = "http://localhost:8081";
   };
 
   # Base (non-VM) boot config so the plain toplevel also evaluates; the

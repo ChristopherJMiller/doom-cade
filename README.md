@@ -51,6 +51,74 @@ The UNVERIFIED IWAD banner is shown because the VM runs Freedoom, not a real
 `doom2.wad`. To get a shell inside, `ssh -p 2222 <host>` (SSH is the only way
 in; there is deliberately no escape from the cabinet itself).
 
+## Installing on real hardware
+
+The repo builds a bootable installer ISO that installs the cabinet onto a
+blank machine with **no network required** — the ISO carries the complete
+cabinet system, this repo's source, and all flake inputs.
+
+**Required pre-step:** set your SSH public key in `nix/hosts/cabinet.nix`
+(`users.users.doom.openssh.authorizedKeys.keys`) *before* building the ISO.
+The installed cabinet is key-only SSH with no console escape — without a key
+baked in it is unreachable except by reinstalling. The installer prints a red
+warning if the list is empty, but by then you have to rebuild the ISO anyway.
+
+```sh
+nix build .#iso          # ≈ 2.2 GB — it embeds the whole cabinet closure
+```
+
+Flash it to a USB stick — **double-check the device**: `lsblk` first, and be
+sure `/dev/sdX` is the stick, not your disk, because `dd` will destroy
+whatever it points at:
+
+```sh
+sudo dd if=result/iso/*.iso of=/dev/sdX bs=4M status=progress oflag=sync
+```
+
+Boot the target machine from the stick (UEFI). You land on a root console;
+run:
+
+```sh
+doom-cade-install
+```
+
+The installer shows `lsblk` of the machine's disks, asks for the target
+device (e.g. `/dev/nvme0n1`), then makes you re-type the device path and type
+`YES` before wiping anything. It then partitions declaratively via
+[disko](https://github.com/nix-community/disko) (1G ESP + btrfs with
+`nix`/`persist` subvolumes; root is tmpfs) and runs the offline install —
+expect a few minutes of flake evaluation followed by the store copy.
+
+No ethernet at the cabinet? Run `nmtui` on the installer console to join
+Wi-Fi (optional — the install itself is fully offline). Any connection you
+set up is carried over to the installed cabinet automatically; to change
+networks later, `ssh doom@<cabinet>` and run `nmtui` there.
+
+**Changing Wi-Fi later (or recovering a cabinet that lost its network).**
+Carry-over only covers day 1 — if the Wi-Fi password rotates, the cabinet
+drops offline and SSH goes with it, so there is a USB recovery path
+mirroring the WAD import: put either a `doom-cade-wifi.txt` (lines
+`ssid=...` / `psk=...`, optional `hidden=1`) or a full NetworkManager
+`*.nmconnection` keyfile (for enterprise/EAP setups) on a USB stick and
+plug it in. It imports within a few seconds and reconnects;
+`journalctl -u 'doom-cade-wifi-import@*'` shows what happened. The honest
+tradeoff: anyone with physical USB access can repoint the cabinet's
+network — consistent with the rest of the machine, where physical access
+already means power, disk, and the WAD slot.
+
+First boot after removing the stick goes straight into the kiosk: attract
+screen, leaderboards, PRESS START — running the bundled Freedoom with the
+UNVERIFIED IWAD banner until you plug in a USB stick containing `doom2.wad`
+(next section). After the import, `journalctl -u 'doom-arcade-wad-import@*'`
+prints the SHA-256 to pin as `services.doom-arcade.iwadSha256`.
+
+The attract screen's top-right corner shows the scoreboard URL — the
+cabinet's LAN IP on port 8080, refreshed as DHCP moves it — for anyone on
+the office subnet to open on their phone. `http://doom-cab.local:8080` works
+too where the network permits mDNS. Browsing is open; submitting scores
+requires the cabinet's locally-minted token, so the board can't be forged
+from a laptop.
+
 ## Loading your DOOM II WAD
 
 The IWAD is copyrighted and is **never** committed to this repo or copied into
@@ -147,11 +215,16 @@ and **Secret hunter**.
 
 ```
 .
-├── flake.nix                  # dev shell, packages, apps (#dev, #leaderboard, #vm)
+├── flake.nix                  # dev shell, packages (#iso), apps (#dev, #leaderboard, #vm)
 ├── nix/
 │   ├── module.nix             # the services.doom-arcade NixOS module
 │   ├── kiosk.nix              # cage, autologin, boot silencing, input lockdown
-│   ├── hosts/cabinet.nix      # the physical machine (set the repo URL here)
+│   ├── wad-import.nix         # thumb-drive doom2.wad auto-import
+│   ├── wifi-import.nix        # thumb-drive Wi-Fi config import / recovery
+│   ├── disk-layout.nix        # disko layout: ESP + btrfs nix/persist, tmpfs root
+│   ├── hosts/cabinet.nix      # the physical machine (set your SSH key here)
+│   ├── hosts/vm.nix           # the #vm test machine
+│   ├── hosts/installer.nix    # the bootable installer ISO (nix build .#iso)
 │   └── pkgs/                  # telemetry-pk3 package + overlay
 ├── crates/
 │   ├── protocol/              # shared wire types, event parser, scoring — source of truth

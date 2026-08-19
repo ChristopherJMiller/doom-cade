@@ -8,9 +8,13 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     impermanence.url = "github:nix-community/impermanence";
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, comin, impermanence }:
+  outputs = { self, nixpkgs, comin, impermanence, disko }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -91,6 +95,10 @@
       packages.${system} = {
         inherit doom-arcade arcade-telemetry-pk3;
         default = doom-arcade;
+        # The bootable installer ISO for real cabinet hardware (README:
+        # "Installing on real hardware"). Expect several GB: it embeds the
+        # whole cabinet system for offline installation.
+        iso = self.nixosConfigurations.installer.config.system.build.isoImage;
       };
 
       apps.${system} = {
@@ -121,11 +129,20 @@
 
       nixosConfigurations.cabinet = nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = { inherit comin impermanence; };
+        specialArgs = { inherit comin impermanence disko; };
         modules = [
           { nixpkgs.overlays = [ overlay ]; }
           ./nix/hosts/cabinet.nix
         ];
+      };
+
+      # Installer ISO (`nix build .#iso`): boots to a root console with
+      # `doom-cade-install`, carrying the cabinet closure + this repo's
+      # source + all flake inputs so the install works fully offline.
+      nixosConfigurations.installer = nixpkgs.lib.nixosSystem {
+        inherit system;
+        specialArgs = { inherit self disko; };
+        modules = [ ./nix/hosts/installer.nix ];
       };
 
       nixosConfigurations.vm = nixpkgs.lib.nixosSystem {
