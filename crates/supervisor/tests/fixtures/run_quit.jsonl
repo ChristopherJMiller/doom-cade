@@ -1,0 +1,30 @@
+GZDoom g4.12.2 - 2024-06-01 - x86_64-pc-linux-gnu
+M_LoadDefaults: Load system defaults.
+W_Init: Init WADfiles.
+ adding /var/lib/doom-arcade/iwad/doom2.wad, 2919 lumps
+ adding /nix/store/9q7l2v-arcade-telemetry/share/arcade-telemetry.pk3, 6 lumps
+Using video driver wayland
+ARCADE_EVT {"v":1,"event":"run_start","session":"44444444-4444-4444-4444-444444444444","initials":"QIT","skill":3,"ts":1755450000}
+MAP01 - Entryway
+ARCADE_EVT {"v":1,"event":"level_enter","session":"44444444-4444-4444-4444-444444444444","map":"MAP01","level_name":"Entryway","ts":1755450001}
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP01","kills":3,"total_monsters":20,"secrets":0,"total_secrets":1,"items":6,"total_items":36,"maptime_tics":700,"px":320,"py":-256}
+Picked up a shotgun.
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP01","kills":8,"total_monsters":20,"secrets":0,"total_secrets":1,"items":13,"total_items":36,"maptime_tics":2100,"px":496,"py":-180}
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP01","kills":14,"total_mon
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP01","kills":14,"total_monsters":20,"secrets":1,"total_secrets":1,"items":19,"total_items":36,"maptime_tics":3900,"px":-64,"py":880}
+ARCADE_EVT {"v":1,"event":"level_complete","session":"44444444-4444-4444-4444-444444444444","map":"MAP01","kills":16,"total_monsters":20,"secrets":1,"total_secrets":1,"items":25,"total_items":36,"maptime_tics":4900}
+MAP02 - Underhalls
+ARCADE_EVT {"v":1,"event":"level_enter","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","level_name":"Underhalls","ts":1755450142}
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","kills":2,"total_monsters":30,"secrets":0,"total_secrets":2,"items":1,"total_items":20,"maptime_tics":420,"px":-1024,"py":64}
+ARCADE_EVT {"v":1,"event":"progress","session":"55555555-5555-5555-5555-555555555555","map":"MAP02","kills":600,"total_monsters":600,"secrets":60,"total_secrets":60,"items":600,"total_items":600,"maptime_tics":35,"px":0,"py":0}
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","kills":5,"total_monsters":30,"secrets":0,"total_secrets":2,"items":2,"total_items":20,"maptime_tics":900,"px":-880,"py":342}
+ARCADE_EVT this is not json at all
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP01","kills":999,"total_monsters":999,"secrets":99,"total_secrets":99,"items":999,"total_items":999,"maptime_tics":1,"px":0,"py":0}
+Picked up a medikit.
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","kills":7,"total_monsters":30,"secrets":1,"total_secrets":2,"items":3,"total_items":20,"maptime_tics":1380,"px":-720,"py":610}
+ARCADE_EVT {"v":2,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","kills":500,"total_monsters":500,"secrets":50,"total_secrets":50,"items":500,"total_items":500,"maptime_tics":1,"px":0,"py":0}
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","kills":9,"total_monsters":30,"secrets":1,"total_secrets":2,"items":4,"total_items":20,"maptime_tics":1800,"px":-512,"py":768}
+ARCADE_EVT {"v":1,"event":"run_quit","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","maptime_tics":1850}
+ARCADE_EVT {"v":1,"event":"progress","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","kills":999,"total_monsters":30,"secrets":2,"total_secrets":2,"items":20,"total_items":20,"maptime_tics":9999,"px":-512,"py":768}
+ARCADE_EVT {"v":1,"event":"run_quit","session":"44444444-4444-4444-4444-444444444444","map":"MAP02","maptime_tics":1850}
+Shutting down sound system

@@ -14,9 +14,11 @@ use time::OffsetDateTime;
 
 const COMPLETE_FIXTURE: &str = include_str!("fixtures/run_complete.jsonl");
 const DEATH_FIXTURE: &str = include_str!("fixtures/run_death.jsonl");
+const QUIT_FIXTURE: &str = include_str!("fixtures/run_quit.jsonl");
 
 const COMPLETE_SESSION: &str = "11111111-1111-1111-1111-111111111111";
 const DEATH_SESSION: &str = "22222222-2222-2222-2222-222222222222";
+const QUIT_SESSION: &str = "44444444-4444-4444-4444-444444444444";
 
 const STARTED: OffsetDateTime = datetime!(2026-08-17 12:00:00 UTC);
 const ENDED: OffsetDateTime = datetime!(2026-08-17 12:20:00 UTC);
@@ -327,6 +329,158 @@ fn hostile_lines_change_nothing_in_death_fixture() {
 }
 
 // ---------------------------------------------------------------------------
+// run_quit.jsonl — quits on MAP02 (held Start); the map in progress is
+// credited from its provisional heartbeat stats
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quit_fixture_replays_to_exact_score() {
+    let mut state = RunState::new(QUIT_SESSION, "QIT", "cab-1", "sha-fixture");
+    let counts = replay(QUIT_FIXTURE.lines(), &mut state);
+
+    // Genuine events: run_start + level_enter MAP01 + 3 progress +
+    // level_complete MAP01 + level_enter MAP02 + 4 progress + run_quit
+    // = 12. Parsed-but-dropped hostiles: 1 wrong-session progress, 1 stale
+    // MAP01 progress while MAP02 was open, and after the terminal
+    // run_quit, 1 inflated progress + 1 duplicate run_quit.
+    assert_eq!(counts.applied, 12);
+    assert_eq!(counts.wrong_session, 1);
+    assert_eq!(counts.duplicate, 0);
+    assert_eq!(counts.out_of_order, 1);
+    assert_eq!(counts.run_over, 2);
+
+    assert_eq!(state.terminal_reason(), Some(EndReason::Quit));
+    let sub = finish(state, EndReason::Quit);
+
+    // Hand-computed:
+    //   MAP01 authoritative close: 16k 1s 25i 4900t(140s)
+    //     → 160+100+125+500+(600-140)*2=920 → 1805
+    //   MAP02 provisional at quit: 9k 1s 4i, no completion or time bonus
+    //     → 90+100+20 → 210
+    //     (tics = max(1800 heartbeat, 1850 run_quit) = 1850 — recorded,
+    //     but never scored: no time bonus without completion)
+    // Sum: 1805+210 = 2015. Depth bonus: 1 × 200 = 200.
+    // Run score: 2015+200 = 2215.
+    assert_eq!(sub.run_score, 2215);
+
+    let scores: Vec<i64> = sub.maps.iter().map(|m| m.map_score).collect();
+    assert_eq!(scores, [1805, 210]);
+    assert_eq!(sub.maps.len(), 2);
+    assert!(sub.maps[0].completed);
+    assert_eq!(sub.maps[1].map, "MAP02");
+    assert!(!sub.maps[1].completed);
+    // Last-heartbeat provisionals, not the inflated post-quit ones.
+    assert_eq!(sub.maps[1].kills, 9);
+    assert_eq!(sub.maps[1].secrets, 1);
+    assert_eq!(sub.maps[1].items, 4);
+    assert_eq!(sub.maps[1].tics, 1850); // the newer run_quit clock
+
+    assert_eq!(sub.maps_completed, 1);
+    assert_eq!(sub.end_reason, EndReason::Quit);
+    // kills 16+9 = 25; secrets 1+1 = 2; items 25+4 = 29;
+    // tics 4900+1850 = 6750.
+    assert_eq!(sub.kills, 25);
+    assert_eq!(sub.secrets, 2);
+    assert_eq!(sub.items, 29);
+    assert_eq!(sub.total_tics, 6750);
+    assert_eq!(sub.initials, "QIT");
+    assert_eq!(sub.recompute_score(), sub.run_score);
+}
+
+/// The 12 genuine events of `run_quit.jsonl`.
+fn genuine_quit_events() -> Vec<Event> {
+    let s = || QUIT_SESSION.to_owned();
+    let progress = |map: &str,
+                    kills,
+                    total_monsters,
+                    secrets,
+                    total_secrets,
+                    items,
+                    total_items,
+                    maptime_tics,
+                    px,
+                    py| {
+        Event::Progress {
+            session: s(),
+            map: map.into(),
+            kills,
+            total_monsters,
+            secrets,
+            total_secrets,
+            items,
+            total_items,
+            maptime_tics,
+            px,
+            py,
+        }
+    };
+    vec![
+        Event::RunStart {
+            session: s(),
+            initials: "QIT".into(),
+            skill: 3,
+            ts: 1_755_450_000,
+        },
+        Event::LevelEnter {
+            session: s(),
+            map: "MAP01".into(),
+            level_name: "Entryway".into(),
+            ts: 1_755_450_001,
+        },
+        progress("MAP01", 3, 20, 0, 1, 6, 36, 700, 320, -256),
+        progress("MAP01", 8, 20, 0, 1, 13, 36, 2100, 496, -180),
+        progress("MAP01", 14, 20, 1, 1, 19, 36, 3900, -64, 880),
+        Event::LevelComplete {
+            session: s(),
+            map: "MAP01".into(),
+            kills: 16,
+            total_monsters: 20,
+            secrets: 1,
+            total_secrets: 1,
+            items: 25,
+            total_items: 36,
+            maptime_tics: 4900,
+        },
+        Event::LevelEnter {
+            session: s(),
+            map: "MAP02".into(),
+            level_name: "Underhalls".into(),
+            ts: 1_755_450_142,
+        },
+        progress("MAP02", 2, 30, 0, 2, 1, 20, 420, -1024, 64),
+        progress("MAP02", 5, 30, 0, 2, 2, 20, 900, -880, 342),
+        progress("MAP02", 7, 30, 1, 2, 3, 20, 1380, -720, 610),
+        progress("MAP02", 9, 30, 1, 2, 4, 20, 1800, -512, 768),
+        Event::RunQuit {
+            session: s(),
+            map: "MAP02".into(),
+            maptime_tics: 1850,
+        },
+    ]
+}
+
+#[test]
+fn hostile_lines_change_nothing_in_quit_fixture() {
+    let mut full = RunState::new(QUIT_SESSION, "QIT", "cab-1", "sha-fixture");
+    replay(QUIT_FIXTURE.lines(), &mut full);
+
+    let mut clean = RunState::new(QUIT_SESSION, "QIT", "cab-1", "sha-fixture");
+    for event in genuine_quit_events() {
+        assert_eq!(
+            clean.apply(&event),
+            ApplyOutcome::Applied,
+            "event: {event:?}"
+        );
+    }
+
+    assert_eq!(
+        finish(full, EndReason::Quit),
+        finish(clean, EndReason::Quit),
+        "hostile fixture lines altered the accumulated run state"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Fixture hygiene
 // ---------------------------------------------------------------------------
 
@@ -334,7 +488,7 @@ fn hostile_lines_change_nothing_in_death_fixture() {
 fn fixtures_contain_noise_and_hostile_material() {
     // Guard against the fixtures being "cleaned up" into pure event
     // streams: they must keep exercising the discard paths.
-    for fixture in [COMPLETE_FIXTURE, DEATH_FIXTURE] {
+    for fixture in [COMPLETE_FIXTURE, DEATH_FIXTURE, QUIT_FIXTURE] {
         let unparseable = fixture
             .lines()
             .filter(|l| parse_event_line(l).is_none())
@@ -344,7 +498,8 @@ fn fixtures_contain_noise_and_hostile_material() {
             "fixture lost its chatter/garbage lines ({unparseable} left)"
         );
     }
-    // Both fixtures carry at least one well-formed foreign-session event.
+    // Every fixture carries at least one well-formed foreign-session event.
     assert!(COMPLETE_FIXTURE.contains("99999999-9999-9999-9999-999999999999"));
     assert!(DEATH_FIXTURE.contains("33333333-3333-3333-3333-333333333333"));
+    assert!(QUIT_FIXTURE.contains("55555555-5555-5555-5555-555555555555"));
 }

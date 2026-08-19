@@ -18,9 +18,12 @@
 //! | `ARCADE_ATTRACT_BIN` | attract binary path | `arcade-attract` (from `$PATH`) |
 //! | `ARCADE_IWAD_UNVERIFIED` | `1` → attract shows the UNVERIFIED IWAD banner | off |
 //! | `ARCADE_IWAD_SHA256` | IWAD hash recorded on submissions | `unknown` |
+//! | `ARCADE_IDLE_TIMEOUT` | walk-away window, seconds | `180` |
+//! | `ARCADE_STALL_TIMEOUT` | telemetry-stall window, seconds | `300` |
 //! | `ARCADE_DEV` | `1` → windowed 1280×720 for gzdoom and attract | off |
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Default IWAD location (SPEC §4.2).
 pub const DEFAULT_IWAD: &str = "/var/lib/doom-arcade/iwad/doom2.wad";
@@ -36,6 +39,12 @@ pub const DEFAULT_CABINET_ID: &str = "cab-1";
 pub const DEFAULT_ATTRACT_BIN: &str = "arcade-attract";
 /// Placeholder recorded when `ARCADE_IWAD_SHA256` is not provided.
 pub const UNKNOWN_IWAD_SHA256: &str = "unknown";
+/// Default walk-away window, in seconds (SPEC §8.4): how long gameplay may
+/// stay completely static before the run is abandoned.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 180;
+/// Default telemetry-stall window, in seconds: how long the telemetry
+/// stream may stay silent before the run is abandoned.
+pub const DEFAULT_STALL_TIMEOUT_SECS: u64 = 300;
 
 /// Fully-resolved supervisor configuration. Cheap to clone; cloned into
 /// each main-loop iteration task.
@@ -73,6 +82,14 @@ pub struct Config {
     pub iwad_unverified: bool,
     /// SHA-256 of the IWAD, recorded on submissions (season key).
     pub iwad_sha256: String,
+    /// Walk-away window: when neither the player position nor the scoring
+    /// counters have changed for this long, the run is abandoned with its
+    /// partial score banked.
+    pub idle_timeout: Duration,
+    /// Telemetry-stall window: when no telemetry event at all arrives for
+    /// this long, the run is abandoned. Longer than the ~2 s heartbeat
+    /// cadence by design — intermissions pause heartbeats.
+    pub stall_timeout: Duration,
     /// Dev mode: gzdoom gets `-width 1280 -height 720 +vid_fullscreen 0`,
     /// attract gets `ARCADE_WINDOWED=1`.
     pub dev: bool,
@@ -108,6 +125,8 @@ impl Config {
             iwad_unverified: parse_bool(get("ARCADE_IWAD_UNVERIFIED")),
             iwad_sha256: get("ARCADE_IWAD_SHA256")
                 .unwrap_or_else(|| UNKNOWN_IWAD_SHA256.to_owned()),
+            idle_timeout: parse_secs(get("ARCADE_IDLE_TIMEOUT"), DEFAULT_IDLE_TIMEOUT_SECS),
+            stall_timeout: parse_secs(get("ARCADE_STALL_TIMEOUT"), DEFAULT_STALL_TIMEOUT_SECS),
             dev: parse_bool(get("ARCADE_DEV")),
         }
     }
@@ -120,6 +139,18 @@ fn parse_bool(value: Option<String>) -> bool {
         let v = v.trim().to_ascii_lowercase();
         v == "1" || v == "true" || v == "yes"
     })
+}
+
+/// Duration env parsing: a positive integer number of seconds. Anything
+/// else — unset, zero, negative, or garbage — falls back to the default,
+/// so a typo in a deployed env file degrades to the shipped behavior
+/// instead of arming an instant (or never-firing) timeout.
+fn parse_secs(value: Option<String>, default_secs: u64) -> Duration {
+    let secs = value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
 }
 
 #[cfg(test)]
@@ -150,6 +181,8 @@ mod tests {
         assert_eq!(cfg.attract_bin, PathBuf::from(DEFAULT_ATTRACT_BIN));
         assert!(!cfg.iwad_unverified);
         assert_eq!(cfg.iwad_sha256, UNKNOWN_IWAD_SHA256);
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(180));
+        assert_eq!(cfg.stall_timeout, Duration::from_secs(300));
         assert!(!cfg.dev);
     }
 
@@ -168,6 +201,8 @@ mod tests {
             ("ARCADE_ATTRACT_BIN", "/opt/attract"),
             ("ARCADE_IWAD_UNVERIFIED", "1"),
             ("ARCADE_IWAD_SHA256", "deadbeef"),
+            ("ARCADE_IDLE_TIMEOUT", "60"),
+            ("ARCADE_STALL_TIMEOUT", "900"),
             ("ARCADE_DEV", "1"),
         ]);
         assert_eq!(cfg.gzdoom_bin, PathBuf::from("/opt/gzdoom/bin/gzdoom"));
@@ -188,7 +223,36 @@ mod tests {
         assert_eq!(cfg.attract_bin, PathBuf::from("/opt/attract"));
         assert!(cfg.iwad_unverified);
         assert_eq!(cfg.iwad_sha256, "deadbeef");
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.stall_timeout, Duration::from_secs(900));
         assert!(cfg.dev);
+    }
+
+    #[test]
+    fn timeout_parsing_accepts_positive_seconds() {
+        let cfg = cfg_from(&[
+            ("ARCADE_IDLE_TIMEOUT", " 45 "),
+            ("ARCADE_STALL_TIMEOUT", "1"),
+        ]);
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(45));
+        assert_eq!(cfg.stall_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timeout_parsing_falls_back_on_invalid_values() {
+        for bad in ["0", "-5", "abc", "1.5", "60s", ""] {
+            let cfg = cfg_from(&[("ARCADE_IDLE_TIMEOUT", bad), ("ARCADE_STALL_TIMEOUT", bad)]);
+            assert_eq!(
+                cfg.idle_timeout,
+                Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+                "input: {bad:?}"
+            );
+            assert_eq!(
+                cfg.stall_timeout,
+                Duration::from_secs(DEFAULT_STALL_TIMEOUT_SECS),
+                "input: {bad:?}"
+            );
+        }
     }
 
     #[test]

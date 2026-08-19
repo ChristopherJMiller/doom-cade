@@ -27,10 +27,25 @@
 //! 4. Feed every line through [`protocol::parse_event_line`] into
 //!    [`RunState`]. On `player_died`: SIGTERM after 3 s (death-animation
 //!    linger), SIGKILL 10 s later if it ignored the SIGTERM. On
-//!    `run_complete`: SIGTERM after 2 s, same SIGKILL escalation.
-//! 5. Watchdog: if *no line at all* (event or chatter, either stream)
-//!    arrives for 20 minutes, the run is abandoned and the engine is
-//!    killed (SIGTERM, then SIGKILL after 10 s).
+//!    `run_complete`: SIGTERM after 2 s, same SIGKILL escalation. On
+//!    `run_quit` (the player held Start): SIGTERM after 1 s, same
+//!    escalation — the pk3 only announces the quit; killing the engine is
+//!    the supervisor's job.
+//! 5. Abandonment guards, innermost to outermost — each fires the same
+//!    kill path (SIGTERM, then SIGKILL after 10 s) and the run ends as
+//!    [`EndReason::Abandoned`] with partial stats kept:
+//!    - **Walk-away**: every applied `progress` heartbeat feeds the pure
+//!      [`IdleTracker`]; when neither the player position nor the
+//!      kills+secrets+items sum has changed for `idle_timeout` (default
+//!      180 s), the player has walked away and the partial score is
+//!      banked.
+//!    - **Telemetry stall**: no telemetry event past the transport gate
+//!      (see step 3) for `stall_timeout` (default 300 s). Heartbeats
+//!      normally flow every ~2 s in-world, but intermission screens pause
+//!      them — hence 300 s, not 60. Disabled when no pk3 is configured:
+//!      with no telemetry to expect, silence proves nothing.
+//!    - **Watchdog**: *no line at all* (event or chatter, either stream)
+//!      for 20 minutes. The outer backstop.
 //! 6. The child is always reaped: a dedicated task owns the [`Child`] and
 //!    `wait()`s it, even if the pump errors out early.
 //!
@@ -55,6 +70,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
+use crate::idle::IdleTracker;
 use crate::run_state::{ApplyOutcome, FinishedRun, RunState};
 
 /// Abandon-and-kill threshold: no output of any kind for this long
@@ -64,6 +80,9 @@ pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const DEATH_LINGER: Duration = Duration::from_secs(3);
 /// Linger after `run_complete` before SIGTERM.
 const COMPLETE_LINGER: Duration = Duration::from_secs(2);
+/// Linger after `run_quit` before SIGTERM. Short: the player already asked
+/// to leave, and the pk3 cannot exit the engine itself.
+const QUIT_LINGER: Duration = Duration::from_secs(1);
 /// Grace between SIGTERM and SIGKILL escalation.
 const KILL_GRACE: Duration = Duration::from_secs(10);
 /// Max quiet time while draining buffered lines after child exit.
@@ -133,14 +152,15 @@ pub async fn run_session(
     let mut stdout_lines = CappedLines::new(BufReader::new(stdout));
     let mut fifo_open = true;
     let mut stdout_open = true;
-    let mut pump = EventPump {
-        state: RunState::new(session_id, initials, &cfg.cabinet_id, &cfg.iwad_sha256),
+    let mut pump = EventPump::new(
+        RunState::new(session_id, initials, &cfg.cabinet_id, &cfg.iwad_sha256),
         pid,
-        fifo_latched: false,
-        term_at: None,
-        kill_at: None,
-        watchdog_at: Instant::now() + WATCHDOG_TIMEOUT,
-    };
+        cfg.idle_timeout,
+        // No pk3 means no telemetry to expect: a telemetry-silence guard
+        // would kill every (unscored) run at the stall window, so only the
+        // outer any-line watchdog applies.
+        cfg.pk3.is_some().then_some(cfg.stall_timeout),
+    );
 
     loop {
         tokio::select! {
@@ -191,17 +211,34 @@ pub async fn run_session(
                 send_signal(pump.pid, Signal::SIGKILL);
                 pump.kill_at = None;
             }
+            _ = tokio::time::sleep_until(pump.idle_at.unwrap_or_else(far_future)),
+                if pump.idle_at.is_some() =>
+            {
+                warn!(
+                    "no movement or scoring for {}s; player walked away; \
+                     banking partial score and killing gzdoom",
+                    cfg.idle_timeout.as_secs()
+                );
+                pump.abandon_now();
+            }
+            _ = tokio::time::sleep_until(pump.stall_at.unwrap_or_else(far_future)),
+                if pump.stall_at.is_some() =>
+            {
+                warn!(
+                    "no telemetry for {}s; abandoning run and killing gzdoom",
+                    cfg.stall_timeout.as_secs()
+                );
+                pump.abandon_now();
+            }
             _ = tokio::time::sleep_until(pump.watchdog_at) => {
                 warn!(
                     "no output for {}s; abandoning run and killing gzdoom",
                     WATCHDOG_TIMEOUT.as_secs()
                 );
-                send_signal(pump.pid, Signal::SIGTERM);
-                let now = Instant::now();
-                pump.kill_at = Some(now + KILL_GRACE);
+                pump.abandon_now();
                 // Re-arm far enough out that it cannot re-fire before the
                 // SIGKILL path settles things.
-                pump.watchdog_at = now + WATCHDOG_TIMEOUT;
+                pump.watchdog_at = Instant::now() + WATCHDOG_TIMEOUT;
             }
         }
     }
@@ -247,6 +284,24 @@ struct EventPump {
     /// machine (a lagged enter+complete block replayed cross-stream would
     /// double-count a map). Stdout stays a watchdog liveness source.
     fifo_latched: bool,
+    /// Walk-away detector, fed by every applied `progress` heartbeat.
+    idle: IdleTracker,
+    /// When the walk-away guard declares the run abandoned: the idle
+    /// tracker's deadline, mirrored into a field so the select loop can
+    /// sleep on it. `None` before the first heartbeat and once the run is
+    /// decided.
+    idle_at: Option<Instant>,
+    /// Telemetry-stall window; `None` disables the stall guard entirely
+    /// (no pk3 → no telemetry to expect).
+    stall_timeout: Option<Duration>,
+    /// When the stall guard declares the run abandoned. Re-armed to
+    /// now + `stall_timeout` by every parsed telemetry event; `None` when
+    /// the guard is disabled or once the run is decided.
+    stall_at: Option<Instant>,
+    /// Set once an abandonment guard has fired. Blocks the guards from
+    /// re-arming: an engine that ignores SIGTERM but keeps heart-beating
+    /// must not push its own SIGKILL deadline out forever.
+    abandoning: bool,
     /// When to send SIGTERM (armed by a terminal event or the watchdog).
     term_at: Option<Instant>,
     /// When to escalate to SIGKILL.
@@ -256,13 +311,38 @@ struct EventPump {
 }
 
 impl EventPump {
+    /// Creates a pump with every deadline armed from now. `stall_timeout:
+    /// None` disables the telemetry-stall guard.
+    fn new(
+        state: RunState,
+        pid: Pid,
+        idle_timeout: Duration,
+        stall_timeout: Option<Duration>,
+    ) -> Self {
+        let now = Instant::now();
+        EventPump {
+            state,
+            pid,
+            fifo_latched: false,
+            idle: IdleTracker::new(idle_timeout),
+            idle_at: None,
+            stall_timeout,
+            stall_at: stall_timeout.map(|t| now + t),
+            abandoning: false,
+            term_at: None,
+            kill_at: None,
+            watchdog_at: now + WATCHDOG_TIMEOUT,
+        }
+    }
+
     /// Handles one line from either stream: feeds the watchdog, parses,
-    /// applies, and arms the kill timers on terminal events. Telemetry on
-    /// stdout is dropped once the FIFO has delivered any event (see
-    /// [`EventPump::fifo_latched`]).
+    /// applies, feeds the walk-away/stall guards, and arms the kill timers
+    /// on terminal events. Telemetry on stdout is dropped once the FIFO
+    /// has delivered any event (see [`EventPump::fifo_latched`]).
     fn on_line(&mut self, source: &'static str, line: &str) {
         // ANY line is proof of life, event or not (SPEC §8.4).
-        self.watchdog_at = Instant::now() + WATCHDOG_TIMEOUT;
+        let now = Instant::now();
+        self.watchdog_at = now + WATCHDOG_TIMEOUT;
         trace!(source, %line, "line");
         let Some(event) = parse_event_line(line) else {
             return;
@@ -276,24 +356,76 @@ impl EventPump {
             );
             return;
         }
+        // Any telemetry that gets past the transport gate — whatever the
+        // state machine then does with it — proves the live pipeline is
+        // still delivering: re-arm the stall guard while it is armed at
+        // all. Post-latch stdout copies deliberately do NOT count: if the
+        // FIFO dies, the lagged mirror can no longer advance the run, and
+        // the stall guard is exactly what ends it.
+        if self.stall_at.is_some() {
+            self.stall_at = self.stall_timeout.map(|t| now + t);
+        }
         match self.state.apply(&event) {
             ApplyOutcome::Applied => match &event {
                 Event::PlayerDied { map, .. } => {
                     info!(%map, "player died; SIGTERM in {}s", DEATH_LINGER.as_secs());
-                    let now = Instant::now();
-                    self.term_at = Some(now + DEATH_LINGER);
-                    self.kill_at = Some(now + DEATH_LINGER + KILL_GRACE);
+                    self.arm_exit(DEATH_LINGER);
                 }
                 Event::RunComplete { .. } => {
                     info!("run complete; SIGTERM in {}s", COMPLETE_LINGER.as_secs());
-                    let now = Instant::now();
-                    self.term_at = Some(now + COMPLETE_LINGER);
-                    self.kill_at = Some(now + COMPLETE_LINGER + KILL_GRACE);
+                    self.arm_exit(COMPLETE_LINGER);
+                }
+                Event::RunQuit { map, .. } => {
+                    info!(%map, "player quit the run; SIGTERM in {}s", QUIT_LINGER.as_secs());
+                    self.arm_exit(QUIT_LINGER);
+                }
+                Event::Progress {
+                    px,
+                    py,
+                    kills,
+                    secrets,
+                    items,
+                    ..
+                } => {
+                    debug!(?event, "event applied");
+                    if !self.abandoning {
+                        let counters = kills.saturating_add(*secrets).saturating_add(*items);
+                        self.idle_at = if self.idle.observe(now, *px, *py, counters) {
+                            // The window elapsed between heartbeats (e.g.
+                            // the loop was busy): fire the guard now.
+                            Some(now)
+                        } else {
+                            self.idle.deadline()
+                        };
+                    }
                 }
                 _ => debug!(?event, "event applied"),
             },
             outcome => debug!(?outcome, ?event, "event dropped"),
         }
+    }
+
+    /// Arms the SIGTERM/SIGKILL pair `linger` from now and disarms the
+    /// walk-away/stall guards: the run is decided, and a guard firing
+    /// during the linger would only re-signal a child already being shut
+    /// down.
+    fn arm_exit(&mut self, linger: Duration) {
+        let now = Instant::now();
+        self.term_at = Some(now + linger);
+        self.kill_at = Some(now + linger + KILL_GRACE);
+        self.idle_at = None;
+        self.stall_at = None;
+    }
+
+    /// The immediate abandonment kill path shared by the walk-away, stall,
+    /// and watchdog guards: SIGTERM now, SIGKILL after the grace, and no
+    /// guard may fire or re-arm again.
+    fn abandon_now(&mut self) {
+        send_signal(self.pid, Signal::SIGTERM);
+        self.kill_at = Some(Instant::now() + KILL_GRACE);
+        self.idle_at = None;
+        self.stall_at = None;
+        self.abandoning = true;
     }
 }
 
@@ -467,14 +599,12 @@ mod tests {
     const SESSION: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
     fn pump() -> EventPump {
-        EventPump {
-            state: RunState::new(SESSION, "ABC", "cab-test", "sha-test"),
-            pid: Pid::from_raw(0),
-            fifo_latched: false,
-            term_at: None,
-            kill_at: None,
-            watchdog_at: Instant::now() + WATCHDOG_TIMEOUT,
-        }
+        EventPump::new(
+            RunState::new(SESSION, "ABC", "cab-test", "sha-test"),
+            Pid::from_raw(0),
+            Duration::from_secs(180),
+            Some(Duration::from_secs(300)),
+        )
     }
 
     fn enter(map: &str) -> String {
@@ -504,6 +634,30 @@ mod tests {
         format_event_line(&Event::RunComplete {
             session: SESSION.into(),
             total_maptime_tics: 7000,
+        })
+    }
+
+    fn progress(map: &str, kills: i64, px: i64, py: i64) -> String {
+        format_event_line(&Event::Progress {
+            session: SESSION.into(),
+            map: map.into(),
+            kills,
+            total_monsters: 30,
+            secrets: 0,
+            total_secrets: 2,
+            items: 0,
+            total_items: 20,
+            maptime_tics: 700,
+            px,
+            py,
+        })
+    }
+
+    fn run_quit(map: &str) -> String {
+        format_event_line(&Event::RunQuit {
+            session: SESSION.into(),
+            map: map.into(),
+            maptime_tics: 1850,
         })
     }
 
@@ -564,6 +718,110 @@ mod tests {
         assert_eq!(sub.maps.len(), 1);
         assert_eq!(sub.maps_completed, 1);
         assert_eq!(sub.kills, 10);
+    }
+
+    /// `run_quit` must arm the prompt SIGTERM/SIGKILL pair (the pk3 only
+    /// announces the quit; the supervisor kills the engine) and disarm the
+    /// abandonment guards.
+    #[test]
+    fn run_quit_arms_prompt_shutdown_and_disarms_guards() {
+        let mut p = pump();
+        p.on_line("fifo", &enter("MAP01"));
+        p.on_line("fifo", &progress("MAP01", 3, 100, -200));
+        assert!(p.idle_at.is_some());
+        assert!(p.stall_at.is_some());
+        let before = Instant::now();
+        p.on_line("fifo", &run_quit("MAP01"));
+        assert_eq!(p.state.terminal_reason(), Some(EndReason::Quit));
+        let term_at = p.term_at.expect("SIGTERM must be armed");
+        let kill_at = p.kill_at.expect("SIGKILL must be armed");
+        assert!(term_at >= before + QUIT_LINGER);
+        assert!(term_at <= Instant::now() + QUIT_LINGER);
+        assert_eq!(kill_at, term_at + KILL_GRACE);
+        assert!(p.idle_at.is_none(), "walk-away guard must be disarmed");
+        assert!(p.stall_at.is_none(), "stall guard must be disarmed");
+        let sub = finish(p);
+        assert_eq!(sub.end_reason, EndReason::Quit);
+    }
+
+    /// `progress` heartbeats drive the walk-away deadline: static input
+    /// leaves it in place, movement pushes it out.
+    #[test]
+    fn progress_feeds_the_walkaway_guard() {
+        let mut p = pump();
+        assert_eq!(p.idle_at, None, "no heartbeat yet, no idle deadline");
+        p.on_line("fifo", &enter("MAP01"));
+        assert_eq!(p.idle_at, None, "only progress feeds the tracker");
+        p.on_line("fifo", &progress("MAP01", 3, 100, -200));
+        let first = p.idle_at.expect("first heartbeat arms the deadline");
+        // Static heartbeat: the deadline must not move.
+        p.on_line("fifo", &progress("MAP01", 3, 100, -200));
+        assert_eq!(p.idle_at, Some(first));
+        // Movement: the deadline re-anchors later.
+        p.on_line("fifo", &progress("MAP01", 3, 500, -200));
+        assert!(p.idle_at.expect("still armed") >= first);
+        // More kills at the same spot is also activity.
+        p.on_line("fifo", &progress("MAP01", 7, 500, -200));
+        assert!(p.idle_at.is_some());
+    }
+
+    /// Events that the state machine drops must not reset the walk-away
+    /// window — a stale writer cannot keep a dead run "active".
+    #[test]
+    fn dropped_progress_does_not_feed_the_walkaway_guard() {
+        let mut p = pump();
+        let foreign = format_event_line(&Event::Progress {
+            session: "some-other-session".into(),
+            map: "MAP01".into(),
+            kills: 3,
+            total_monsters: 30,
+            secrets: 0,
+            total_secrets: 2,
+            items: 0,
+            total_items: 20,
+            maptime_tics: 700,
+            px: 100,
+            py: -200,
+        });
+        p.on_line("fifo", &foreign);
+        assert_eq!(p.idle_at, None);
+    }
+
+    /// Engine chatter is watchdog food but must not re-arm the stall
+    /// guard: only parsed telemetry proves the pk3 pipeline is alive.
+    #[test]
+    fn chatter_does_not_rearm_the_stall_guard() {
+        let mut p = pump();
+        let armed = p.stall_at.expect("stall guard starts armed");
+        p.on_line("fifo", "Init: DOOM 2: Hell on Earth");
+        p.on_line("stdout", "Picked up a shotgun.");
+        assert_eq!(
+            p.stall_at,
+            Some(armed),
+            "chatter must not touch the stall deadline"
+        );
+        p.on_line("fifo", &enter("MAP01"));
+        assert!(p.stall_at.expect("still armed") >= armed);
+    }
+
+    /// After an abandonment guard fires, further static heartbeats must
+    /// not re-arm the guards (or the SIGKILL could be pushed out forever).
+    #[test]
+    fn guards_do_not_rearm_after_abandonment() {
+        let mut p = pump();
+        p.on_line("fifo", &enter("MAP01"));
+        p.on_line("fifo", &progress("MAP01", 3, 100, -200));
+        // Simulate a fired guard by hand — calling abandon_now() here
+        // would kill(pid 0, SIGTERM) our own process group.
+        let kill_at = Instant::now() + KILL_GRACE;
+        p.kill_at = Some(kill_at);
+        p.idle_at = None;
+        p.stall_at = None;
+        p.abandoning = true;
+        p.on_line("fifo", &progress("MAP01", 3, 100, -200));
+        assert_eq!(p.idle_at, None, "walk-away must stay disarmed");
+        assert_eq!(p.stall_at, None, "stall must stay disarmed");
+        assert_eq!(p.kill_at, Some(kill_at), "SIGKILL deadline must not move");
     }
 
     async fn collect_lines(data: &[u8]) -> Vec<String> {

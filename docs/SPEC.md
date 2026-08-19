@@ -124,6 +124,10 @@ Events and the fields each carries:
 | `level_complete` | `WorldUnloaded` | `session`, `map`, `kills`, `total_monsters`, `secrets`, `total_secrets`, `items`, `total_items`, `maptime_tics` |
 | `player_died` | `PlayerDied` | `session`, `map`, `kills`, `secrets`, `maptime_tics` |
 | `run_complete` | final-map unload / end sequence | `session`, `total_maptime_tics` |
+| `progress` | `WorldTick`, every 70 tics (~2 s) | `session`, `map`, all `level_complete` counters so far, `maptime_tics`, `px`, `py` (player position, whole map units) |
+| `run_quit` | Start held ~3 s in-game (`InputProcess` + `WorldTick`) | `session`, `map`, `maptime_tics` |
+
+`progress` exists so a run that ends without a clean map exit — deliberate quit, walk-away, engine crash — still credits the map in progress: the supervisor banks the latest heartbeat as provisional stats for the open map. `run_quit` is the deliberate early exit (workplace reality: people get pulled away mid-run); the supervisor terminates the engine and the run scores with `end_reason = 'quit'`, no completion/time bonus for the open map.
 
 Stat fields come from `LevelLocals`: `Level.killed_monsters`, `Level.total_monsters`, `Level.found_secrets`, `Level.total_secrets`, `Level.found_items`, `Level.total_items`, `Level.maptime` (tics; 35 tics = 1 second), `Level.MapName`, `Level.LevelName`. Verify each name against the GZDoom version pinned in the flake before relying on it — the ZScript API does shift between releases.
 
@@ -134,6 +138,8 @@ ARCADE_EVT {"v":1,"event":"level_complete","session":"...","map":"MAP01",...}
 ```
 
 `session` and `initials` are read from user cvars declared in `CVARINFO.txt` (`arcade_session`, `arcade_initials`, both `user string`), set by the supervisor on the command line with `+set`. Escape both defensively — treat them as untrusted when building the JSON string.
+
+The handler also renders a top-right HUD overlay via `RenderOverlay` for walk-up players: a live score (mirrors the §5 formula client-side, display-only — the supervisor/server recomputation stays authoritative), rotation progress ("MAP 2/5" plus level name), and a compact controls block that shows in full for the first ~15 seconds of each map, then collapses to score + map + a permanently visible "HOLD START — END RUN + BANK SCORE" line (discoverability for the deliberate-quit path).
 
 ### 4.6 Event transport
 
@@ -291,9 +297,13 @@ gzdoom
 
 The local SQLite spool is the source of truth on the cabinet. Every run is written there first, then a background task submits pending runs with exponential backoff (cap ~5 min) and marks them submitted on 2xx. Because `POST /v1/runs` is idempotent on `session`, retries after ambiguous failures are safe. The cabinet is fully playable with the network down; scores land when it returns.
 
-### 8.4 Watchdog
+### 8.4 Watchdogs and walk-away detection
 
-If gzdoom produces no event and no output for 20 minutes, treat the run as abandoned, kill it, and return to attract. Prevents a walked-away player from occupying the cabinet indefinitely.
+Three layers, all of which bank the partial score rather than discard it:
+
+1. **Idle (walk-away)**: `progress` heartbeats carry player position and stat counters. If neither moves for `ARCADE_IDLE_TIMEOUT` (default 180 s), the player left mid-run — kill gzdoom, `end_reason = 'abandoned'`, score banked. This is the primary workplace path: someone gets called into a meeting and just walks off.
+2. **Stall**: no telemetry line at all for `ARCADE_STALL_TIMEOUT` (default 300 s) — heartbeats normally flow every 2 s in-world, but intermissions pause them, hence the generous window. Engine hung or wedged at an intermission: kill, `'abandoned'`, banked.
+3. **Hard watchdog**: no line of any kind for 20 minutes — the outer backstop.
 
 ---
 
@@ -354,7 +364,7 @@ USB encoder (Zero Delay / Xin-Mo class) configured in **keyboard mode**, so the 
 | Button 4 | `.` | Strafe right |
 | Button 5 | `[` | Previous weapon |
 | Button 6 | `]` | Next weapon |
-| Start | `Enter` | Confirm / start run |
+| Start | `Enter` | Confirm / start run; **hold ~3 s in-game to end the run** and bank the partial score |
 | (none) | — | Run is **always on** via `cl_run 1`; do not spend a button on it |
 
 Menu access must be suppressed during a run — rebind or unbind `Esc` in the pristine config so a player cannot reach settings, quit, or save. The attract app handles all out-of-game interaction.

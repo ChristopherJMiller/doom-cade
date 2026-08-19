@@ -9,7 +9,8 @@
 //! 2. mints a session UUID and [spawns gzdoom](session) with a pristine
 //!    per-session config, reading the telemetry event stream,
 //! 3. folds events into a [`RunState`](run_state::RunState) and, when the
-//!    run ends (death, clear, abandonment, or watchdog), computes the score,
+//!    run ends (death, clear, deliberate quit, walk-away, abandonment, or
+//!    watchdog), computes the score,
 //! 4. writes the finished run to the local [SQLite spool](spool) — the
 //!    source of truth on the cabinet — and
 //! 5. kicks the background [submitter](submitter), which POSTs pending runs
@@ -22,6 +23,7 @@
 
 pub mod attract;
 pub mod config;
+pub mod idle;
 pub mod main_loop;
 pub mod run_state;
 pub mod session;

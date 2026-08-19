@@ -588,6 +588,81 @@ async fn fastest_clear_excludes_deaths() {
     );
 }
 
+/// A deliberate early quit (held Start) is a first-class run: a partial
+/// maps array validates exactly like death/abandoned (the all-maps check
+/// is "complete"-only), the run ranks on every board except fastest-clear,
+/// and resubmission stays idempotent.
+#[tokio::test]
+async fn quit_run_is_first_class() {
+    let app = test_app(None).await;
+    // A full clear first, so fastest-clear has a legitimate entry to
+    // contrast against the quit run's absence.
+    let clear = run_with(
+        "s-clear",
+        "AAA",
+        "cab-1",
+        3600,
+        EndReason::Complete,
+        &[(20, 1, 120, true); 5],
+    );
+    let (status, _) = send(&app, post_run(&clear, None)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Quit mid-run: MAP01 cleared, MAP02 abandoned partway with partial
+    // stats and a correctly recomputed (partial) score.
+    let quit = run_with(
+        "s-quit",
+        "QUI",
+        "cab-1",
+        600,
+        EndReason::Quit,
+        &[(30, 2, 200, true), (12, 1, 60, false)],
+    );
+    let (status, body) = send(&app, post_run(&quit, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let stored: RunSubmission = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stored, quit);
+
+    let (status, body) = get_boards(&app, "/v1/boards").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: BoardsResponse = serde_json::from_slice(&body).unwrap();
+
+    let high = board_by(&resp, BoardCategory::HighScore);
+    assert_eq!(initials_of(high), ["AAA", "QUI"]);
+    assert_eq!(high.entries[1].value, quit.run_score);
+    assert_eq!(
+        initials_of(board_by(&resp, BoardCategory::Deepest)),
+        ["AAA", "QUI"]
+    );
+    assert_eq!(
+        initials_of(board_by(&resp, BoardCategory::MostKills)),
+        ["AAA", "QUI"]
+    );
+    assert_eq!(
+        initials_of(board_by(&resp, BoardCategory::SecretHunter)),
+        ["AAA", "QUI"]
+    );
+    assert_eq!(
+        initials_of(board_by(&resp, BoardCategory::FastestClear)),
+        ["AAA"],
+        "quit runs must not appear on fastest-clear"
+    );
+
+    // Idempotent resubmit: 200 with the original record, no second row.
+    let (status, body) = send(&app, post_run(&quit, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored: RunSubmission = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stored, quit);
+    let (_, body) = get_boards(&app, "/v1/boards").await;
+    let resp: BoardsResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(board_by(&resp, BoardCategory::HighScore).entries.len(), 2);
+}
+
 #[tokio::test]
 async fn single_board_endpoint_limit_season_and_404() {
     let app = seeded_ordering_app().await;

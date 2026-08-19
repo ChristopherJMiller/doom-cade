@@ -500,6 +500,7 @@ fn draw_initials(
         let (headline, color) = match end_reason {
             "death" => ("YOU DIED", BLOOD_BRIGHT),
             "complete" => ("RUN COMPLETE", GOLD),
+            "quit" => ("RUN ENDED", OCHRE),
             _ => ("RUN OVER", BLOOD_BRIGHT),
         };
         ui.label(

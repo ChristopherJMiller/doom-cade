@@ -107,7 +107,7 @@ into the pristine `assets/config/gzdoom.ini` copied fresh for every run:
 | Button 4 | `.` | Strafe right |
 | Button 5 | `[` | Previous weapon |
 | Button 6 | `]` | Next weapon |
-| Start | `Enter` | Confirm / start run |
+| Start | `Enter` | Confirm / start run; **hold ~3 s in-game to end the run early** |
 | (none) | — | Run is **always on** via `cl_run 1`; no button spent on it |
 
 `Esc` is suppressed and the menu is unreachable; the attract app handles all
@@ -132,7 +132,12 @@ run_score  = sum(map_score for each map) + depth_bonus (200 * maps_completed)
 ```
 
 Death ends the run; the partial map's kills, secrets, and items still count,
-but there is no completion or time bonus. Raw per-map stats are stored
+but there is no completion or time bonus. The same partial credit applies to
+early exits: hold Start ~3 seconds to end a run deliberately, or just walk
+away — in-game heartbeats track progress, so a run abandoned mid-map is
+detected within a few minutes and banked with whatever was earned (fastest
+clear is the one board reserved for fully completed runs). Raw per-map stats
+are stored
 alongside every score so the formula can be recomputed retroactively; a
 `scoring_version` bump starts a new season. Five boards cycle on the attract
 screen: **High score**, **Deepest run**, **Fastest clear**, **Most kills**,

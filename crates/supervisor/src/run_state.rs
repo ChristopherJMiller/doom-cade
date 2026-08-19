@@ -13,8 +13,8 @@
 //!   this `RunState` was created with is logged and **dropped**
 //!   ([`ApplyOutcome::WrongSession`]). A stale gzdoom or a hostile writer
 //!   on the FIFO cannot touch the current run.
-//! - **Terminal events are final.** After `PlayerDied` or `RunComplete`
-//!   has been applied, every further event is dropped
+//! - **Terminal events are final.** After `PlayerDied`, `RunComplete`, or
+//!   `RunQuit` has been applied, every further event is dropped
 //!   ([`ApplyOutcome::RunOver`]). A duplicate `PlayerDied` or a
 //!   `LevelComplete` arriving after death cannot change anything.
 //! - **`RunStart`** marks the run as started. A second `RunStart` is a
@@ -56,6 +56,33 @@
 //!   `total_maptime_tics` is kept for cross-checking but the submission's
 //!   `total_tics` is always the sum of per-map tics, so it stays
 //!   consistent with the per-map array the server validates against.
+//! - **`Progress`** (the ~2 s in-map heartbeat) carries *provisional*
+//!   stats. For the open map each heartbeat overwrites the provisional
+//!   counters wholesale — the latest observation supersedes the last, and
+//!   an eventual `LevelComplete`/`PlayerDied` overwrites them with
+//!   authoritative values. If no map is open and the named map was never
+//!   recorded, the heartbeat **opens** it provisionally (its `LevelEnter`
+//!   is late or lost — possible with FIFO/stdout races); the late
+//!   `LevelEnter`, when it shows up, drops as a duplicate, keeping the
+//!   provisional stats. If a *different* map is open and the named map is
+//!   new, the open map's exit event was lost: the open map is closed as
+//!   **not completed** and the named map opens provisionally, mirroring
+//!   the `LevelEnter` rule. Provisional data must **never** overwrite an
+//!   authoritatively closed map: a `Progress` naming any already-finalized
+//!   map is stale and is dropped ([`ApplyOutcome::OutOfOrder`]).
+//! - **`RunQuit`** (the player held Start) is terminal. The open map is
+//!   closed as **not completed**, keeping its best-known provisional
+//!   stats; the event's `maptime_tics` replaces the open map's tics only
+//!   when it is newer (the quit clock is the later observation — but a
+//!   stale event must not rewind it). No completion or time bonus is
+//!   fabricated. If the open map's name disagrees with the event, the open
+//!   entry is closed as-is and a minimal entry for the named map is
+//!   synthesized (unless that map is already recorded — an authoritative
+//!   close always stands). If no map is open: a never-recorded map is
+//!   synthesized with only the event's tics so the quit location is still
+//!   recorded; an already-recorded one (quitting from the intermission
+//!   right after its close) is left untouched. The run ends with
+//!   [`EndReason::Quit`].
 //!
 //! [`RunState::finish`] closes any still-open map as not completed
 //! (abandonment mid-map), aggregates totals, computes per-map scores via
@@ -85,8 +112,8 @@ pub enum ApplyOutcome {
     /// stale `LevelComplete` for a map other than the open one) and was
     /// dropped.
     OutOfOrder,
-    /// A terminal event (death or run-complete) was already recorded; the
-    /// run is over and the event was dropped.
+    /// A terminal event (death, run-complete, or run-quit) was already
+    /// recorded; the run is over and the event was dropped.
     RunOver,
 }
 
@@ -137,9 +164,9 @@ impl RunState {
     }
 
     /// The terminal reason recorded so far: `Some(Death)` after
-    /// `PlayerDied`, `Some(Complete)` after `RunComplete`, else `None`.
-    /// The session driver maps `None` at child exit to
-    /// [`EndReason::Abandoned`].
+    /// `PlayerDied`, `Some(Complete)` after `RunComplete`, `Some(Quit)`
+    /// after `RunQuit`, else `None`. The session driver maps `None` at
+    /// child exit to [`EndReason::Abandoned`].
     pub fn terminal_reason(&self) -> Option<EndReason> {
         self.terminal
     }
@@ -312,6 +339,104 @@ impl RunState {
                 self.terminal = Some(EndReason::Complete);
                 ApplyOutcome::Applied
             }
+
+            Event::Progress {
+                map,
+                kills,
+                total_monsters,
+                secrets,
+                total_secrets,
+                items,
+                total_items,
+                maptime_tics,
+                ..
+            } => {
+                let provisional = MapStats {
+                    map: map.clone(),
+                    kills: *kills,
+                    total_monsters: *total_monsters,
+                    secrets: *secrets,
+                    total_secrets: *total_secrets,
+                    items: *items,
+                    total_items: *total_items,
+                    tics: *maptime_tics,
+                    completed: false,
+                };
+                if self.open && self.maps.last().is_some_and(|m| m.map == *map) {
+                    // Heartbeat for the open map: the latest observation
+                    // supersedes the last, wholesale.
+                    *self.maps.last_mut().expect("open implies a last map") = provisional;
+                    ApplyOutcome::Applied
+                } else if self.maps.iter().any(|m| m.map == *map) {
+                    // The named map was already finalized (LevelComplete,
+                    // PlayerDied, or a forced close): provisional data
+                    // never overwrites an authoritative close.
+                    warn!(map = %map, "stale progress for an already-finalized map; dropping");
+                    ApplyOutcome::OutOfOrder
+                } else {
+                    if self.open {
+                        // The open map's exit event was lost: mirror the
+                        // LevelEnter rule — close it without fabricating
+                        // any bonus, then open the heartbeat's map.
+                        warn!(
+                            previous = %self.maps.last().expect("open implies a last map").map,
+                            entering = %map,
+                            "progress for a new map while another open; closing previous as incomplete"
+                        );
+                    } else {
+                        // Heartbeat before level_enter (FIFO/stdout race):
+                        // open the map provisionally so the run still gets
+                        // credit for it.
+                        warn!(map = %map, "progress before level_enter; opening map provisionally");
+                    }
+                    self.maps.push(provisional);
+                    self.open = true;
+                    ApplyOutcome::Applied
+                }
+            }
+
+            Event::RunQuit {
+                map, maptime_tics, ..
+            } => {
+                if self.open {
+                    let current = self.maps.last_mut().expect("open implies a last map");
+                    current.completed = false;
+                    if current.map == *map {
+                        // The quit clock is the later observation, but a
+                        // stale event must not rewind the provisional tics.
+                        current.tics = current.tics.max(*maptime_tics);
+                    } else {
+                        warn!(
+                            open = %current.map,
+                            quit_on = %map,
+                            "run_quit names a different map than the open one"
+                        );
+                        if !self.maps.iter().any(|m| m.map == *map) {
+                            self.maps.push(MapStats {
+                                map: map.clone(),
+                                tics: *maptime_tics,
+                                completed: false,
+                                ..MapStats::default()
+                            });
+                        }
+                    }
+                    self.open = false;
+                } else if self.maps.iter().any(|m| m.map == *map) {
+                    // Quit from the intermission right after the map's
+                    // close: the authoritative close stands untouched.
+                    debug!(map = %map, "run_quit for an already-finalized map; keeping its close");
+                } else {
+                    warn!(map = %map, "run_quit without level_enter; synthesizing map entry");
+                    self.maps.push(MapStats {
+                        map: map.clone(),
+                        tics: *maptime_tics,
+                        completed: false,
+                        ..MapStats::default()
+                    });
+                }
+                self.terminal = Some(EndReason::Quit);
+                ApplyOutcome::Applied
+            }
         }
     }
 
@@ -416,7 +541,9 @@ fn event_session(event: &Event) -> &str {
         | Event::LevelEnter { session, .. }
         | Event::LevelComplete { session, .. }
         | Event::PlayerDied { session, .. }
-        | Event::RunComplete { session, .. } => session,
+        | Event::RunComplete { session, .. }
+        | Event::Progress { session, .. }
+        | Event::RunQuit { session, .. } => session,
     }
 }
 
@@ -475,6 +602,30 @@ mod tests {
         Event::RunComplete {
             session: SESSION.into(),
             total_maptime_tics: total,
+        }
+    }
+
+    fn progress(map: &str, kills: i64, secrets: i64, items: i64, tics: i64) -> Event {
+        Event::Progress {
+            session: SESSION.into(),
+            map: map.into(),
+            kills,
+            total_monsters: 30,
+            secrets,
+            total_secrets: 2,
+            items,
+            total_items: 20,
+            maptime_tics: tics,
+            px: -512,
+            py: 768,
+        }
+    }
+
+    fn run_quit(map: &str, tics: i64) -> Event {
+        Event::RunQuit {
+            session: SESSION.into(),
+            map: map.into(),
+            maptime_tics: tics,
         }
     }
 
@@ -739,5 +890,197 @@ mod tests {
         assert!(!sub.maps[0].completed);
         assert_eq!(sub.maps[1].map, "MAP02");
         assert_eq!(sub.maps[1].kills, 4);
+    }
+
+    #[test]
+    fn progress_updates_open_map_provisionally() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        assert_eq!(
+            s.apply(&progress("MAP01", 3, 0, 1, 700)),
+            ApplyOutcome::Applied
+        );
+        // Each heartbeat supersedes the previous one wholesale.
+        assert_eq!(
+            s.apply(&progress("MAP01", 9, 1, 4, 1800)),
+            ApplyOutcome::Applied
+        );
+        let sub = finish(s, EndReason::Abandoned);
+        assert_eq!(sub.maps.len(), 1);
+        assert!(!sub.maps[0].completed);
+        assert_eq!(sub.maps[0].kills, 9);
+        assert_eq!(sub.maps[0].secrets, 1);
+        assert_eq!(sub.maps[0].items, 4);
+        assert_eq!(sub.maps[0].tics, 1800);
+        assert_eq!(sub.maps[0].total_monsters, 30);
+        // 90 + 100 + 20, no bonuses.
+        assert_eq!(sub.maps[0].map_score, 210);
+    }
+
+    #[test]
+    fn progress_opens_map_when_level_enter_is_late() {
+        let mut s = state();
+        // Heartbeat arrives before the level_enter (FIFO/stdout race).
+        assert_eq!(
+            s.apply(&progress("MAP01", 2, 0, 1, 420)),
+            ApplyOutcome::Applied
+        );
+        // The late level_enter drops as a duplicate: the provisional
+        // stats survive instead of being zeroed.
+        assert_eq!(s.apply(&enter("MAP01")), ApplyOutcome::Duplicate);
+        let sub = finish(s, EndReason::Abandoned);
+        assert_eq!(sub.maps.len(), 1);
+        assert_eq!(sub.maps[0].kills, 2);
+        assert_eq!(sub.maps[0].items, 1);
+    }
+
+    #[test]
+    fn progress_never_overwrites_an_authoritative_close() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&complete("MAP01", 10, 1, 4, 3500));
+        // Stale heartbeat for the closed map, no map open: dropped.
+        assert_eq!(
+            s.apply(&progress("MAP01", 999, 99, 999, 1)),
+            ApplyOutcome::OutOfOrder
+        );
+        // Same with another map open.
+        s.apply(&enter("MAP02"));
+        assert_eq!(
+            s.apply(&progress("MAP01", 999, 99, 999, 1)),
+            ApplyOutcome::OutOfOrder
+        );
+        let sub = finish(s, EndReason::Abandoned);
+        assert_eq!(sub.maps[0].kills, 10);
+        assert_eq!(sub.maps[0].tics, 3500);
+        assert!(sub.maps[0].completed);
+    }
+
+    #[test]
+    fn progress_after_terminal_is_dropped() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&died("MAP01", 3, 0, 200));
+        assert_eq!(
+            s.apply(&progress("MAP01", 999, 99, 999, 9999)),
+            ApplyOutcome::RunOver
+        );
+        let sub = finish(s, EndReason::Death);
+        assert_eq!(sub.maps[0].kills, 3);
+    }
+
+    #[test]
+    fn progress_for_new_map_while_open_closes_previous() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        // MAP01's exit event was lost; MAP02's heartbeat proves the run
+        // moved on. MAP01 closes without any fabricated bonus.
+        assert_eq!(
+            s.apply(&progress("MAP02", 2, 0, 0, 350)),
+            ApplyOutcome::Applied
+        );
+        let sub = finish(s, EndReason::Abandoned);
+        assert_eq!(sub.maps.len(), 2);
+        assert!(!sub.maps[0].completed);
+        assert_eq!(sub.maps[0].map_score, 0);
+        assert_eq!(sub.maps[1].map, "MAP02");
+        assert_eq!(sub.maps[1].kills, 2);
+    }
+
+    #[test]
+    fn run_quit_closes_open_map_keeping_provisional_stats() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&complete("MAP01", 10, 1, 4, 3500));
+        s.apply(&enter("MAP02"));
+        s.apply(&progress("MAP02", 9, 1, 4, 1800));
+        // Quit clock is newer than the last heartbeat: it wins.
+        assert_eq!(s.apply(&run_quit("MAP02", 1850)), ApplyOutcome::Applied);
+        assert_eq!(s.terminal_reason(), Some(EndReason::Quit));
+        let sub = finish(s, EndReason::Quit);
+        assert_eq!(sub.end_reason, EndReason::Quit);
+        assert_eq!(sub.maps_completed, 1);
+        assert_eq!(sub.maps.len(), 2);
+        assert!(!sub.maps[1].completed);
+        assert_eq!(sub.maps[1].kills, 9);
+        assert_eq!(sub.maps[1].tics, 1850);
+        // MAP01: 100+100+20+500+(600-100)*2=1000 → 1720. MAP02: 90+100+20
+        // = 210, no bonuses. Depth bonus 200. Total 2130.
+        assert_eq!(sub.run_score, 2130);
+    }
+
+    #[test]
+    fn run_quit_does_not_rewind_newer_provisional_tics() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&progress("MAP01", 5, 0, 2, 1800));
+        // A stale quit clock must not rewind the map time.
+        assert_eq!(s.apply(&run_quit("MAP01", 1700)), ApplyOutcome::Applied);
+        let sub = finish(s, EndReason::Quit);
+        assert_eq!(sub.maps[0].tics, 1800);
+    }
+
+    #[test]
+    fn run_quit_with_no_open_map_synthesizes_entry() {
+        let mut s = state();
+        assert_eq!(s.apply(&run_quit("MAP01", 900)), ApplyOutcome::Applied);
+        assert_eq!(s.terminal_reason(), Some(EndReason::Quit));
+        let sub = finish(s, EndReason::Quit);
+        assert_eq!(sub.maps.len(), 1);
+        assert_eq!(sub.maps[0].map, "MAP01");
+        assert!(!sub.maps[0].completed);
+        assert_eq!(sub.maps[0].tics, 900);
+        assert_eq!(sub.run_score, 0);
+        assert_eq!(sub.maps_completed, 0);
+    }
+
+    #[test]
+    fn run_quit_after_close_keeps_the_authoritative_close() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&complete("MAP01", 10, 1, 4, 3500));
+        // Player quits from the intermission: the completed map must stay
+        // completed with its authoritative stats and tics.
+        assert_eq!(s.apply(&run_quit("MAP01", 3600)), ApplyOutcome::Applied);
+        let sub = finish(s, EndReason::Quit);
+        assert_eq!(sub.maps.len(), 1);
+        assert!(sub.maps[0].completed);
+        assert_eq!(sub.maps[0].tics, 3500);
+        assert_eq!(sub.maps_completed, 1);
+    }
+
+    #[test]
+    fn run_quit_on_unexpected_map_closes_open_and_synthesizes() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        s.apply(&progress("MAP01", 5, 0, 2, 700));
+        assert_eq!(s.apply(&run_quit("MAP02", 100)), ApplyOutcome::Applied);
+        let sub = finish(s, EndReason::Quit);
+        assert_eq!(sub.maps.len(), 2);
+        assert!(!sub.maps[0].completed);
+        assert_eq!(sub.maps[0].kills, 5); // provisional stats kept
+        assert_eq!(sub.maps[1].map, "MAP02");
+        assert_eq!(sub.maps[1].tics, 100);
+        assert!(!sub.maps[1].completed);
+    }
+
+    #[test]
+    fn events_after_run_quit_are_dropped() {
+        let mut s = state();
+        s.apply(&enter("MAP01"));
+        assert_eq!(s.apply(&run_quit("MAP01", 500)), ApplyOutcome::Applied);
+        assert_eq!(s.apply(&run_quit("MAP01", 500)), ApplyOutcome::RunOver);
+        assert_eq!(s.apply(&enter("MAP02")), ApplyOutcome::RunOver);
+        assert_eq!(
+            s.apply(&complete("MAP01", 50, 5, 50, 100)),
+            ApplyOutcome::RunOver
+        );
+        assert_eq!(
+            s.apply(&progress("MAP01", 99, 9, 99, 999)),
+            ApplyOutcome::RunOver
+        );
+        let sub = finish(s, EndReason::Quit);
+        assert_eq!(sub.maps.len(), 1);
+        assert_eq!(sub.kills, 0);
     }
 }
