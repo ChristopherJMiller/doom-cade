@@ -55,15 +55,33 @@
       qemu.options = [
         ''''${ARCADE_VM_DISPLAY:--device virtio-vga-gl -display gtk,gl=on,show-cursor=off}''
       ];
-      # ssh -p 2222 doom@localhost
+      # ssh -p 2222 doom@localhost; leaderboard web view (canvas fire and
+      # all) at http://localhost:8081 on the host.
       forwardPorts = [
         {
           from = "host";
           host.port = 2222;
           guest.port = 22;
         }
+        {
+          from = "host";
+          host.port = 8081;
+          guest.port = 8080;
+        }
       ];
     };
+
+    # QEMU user-net port forwards target the guest's NIC address, not
+    # loopback, so the leaderboard must bind wide for the 8081 forward to
+    # reach it. VM-variant only; supervisor/attract stay on the loopback
+    # URL. Firewall opened directly (the module's openFirewall option
+    # deliberately refuses to open an unauthenticated POST to a LAN; a
+    # throwaway VM behind user-net NAT is the one place that's fine).
+    services.doom-arcade.leaderboard = {
+      listen = "0.0.0.0:8080";
+      url = "http://127.0.0.1:8080";
+    };
+    networking.firewall.allowedTCPPorts = [ 8080 ];
 
     # Dev affordance, VM-variant only: the kiosk config is key-only SSH with
     # no keys, which would make the VM a locked box. Give doom a password and

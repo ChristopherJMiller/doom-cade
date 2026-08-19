@@ -1,20 +1,20 @@
 //! Spawning and supervising the attract app (SPEC §11).
 //!
-//! Contract with `arcade-attract`: it runs fullscreen forever (the idle
-//! reel loops internally) and, when a player finishes initials entry, it
-//! prints exactly one line
+//! The attract binary runs in one of two modes, selected via `ARCADE_MODE`:
 //!
-//! ```text
-//! ARCADE_INITIALS ABC
-//! ```
+//! - **Attract** (default): the idle reel. When the player presses Start it
+//!   prints exactly one line `ARCADE_START`, flushes, and exits 0.
+//! - **Initials** (`ARCADE_MODE=initials`): the post-run initials wheel,
+//!   shown with the finished run's score (`ARCADE_SCORE`) and end reason
+//!   (`ARCADE_END_REASON`). It prints exactly one line
+//!   `ARCADE_INITIALS ABC`, flushes, and exits 0 — entering three
+//!   characters or timing out and auto-padding, so it always hands off.
 //!
-//! to stdout, flushes, and exits 0. It never exits otherwise. The
-//! supervisor therefore reads stdout line by line, ignoring everything
-//! that is not a valid initials line, and treats an exit *without*
-//! initials (crash, misconfiguration) as a failure: it logs and restarts
-//! attract after 2 seconds, forever. There is no error path out of
-//! [`acquire_initials`] — a cabinet with a broken attract binary shows
-//! nothing, but the supervisor stays alive and keeps retrying.
+//! The supervisor reads stdout line by line, ignoring everything that is
+//! not the expected handoff line. [`wait_for_start`] restarts a crashed
+//! attract forever (nothing is at stake yet); [`acquire_initials`] retries
+//! only a few times and then falls back to `AAA` — a finished score must
+//! never be held hostage by a broken attract binary.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -29,7 +29,17 @@ use crate::config::Config;
 /// Prefix of the initials handoff line, trailing space included.
 pub const INITIALS_PREFIX: &str = "ARCADE_INITIALS ";
 
-/// Delay before restarting attract after it exits without initials.
+/// The attract-mode handoff line (Start pressed; no payload).
+pub const START_LINE: &str = "ARCADE_START";
+
+/// Initials used when the post-run attract cannot produce any (crash
+/// loop): the score still gets on the board.
+pub const FALLBACK_INITIALS: &str = "AAA";
+
+/// Attempts at collecting post-run initials before falling back.
+const INITIALS_ATTEMPTS: u32 = 3;
+
+/// Delay before restarting attract after it exits without a handoff.
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 /// How long attract gets to exit after closing stdout before being killed.
 const EXIT_GRACE: Duration = Duration::from_secs(10);
@@ -46,31 +56,78 @@ pub fn parse_initials_line(line: &str) -> Option<String> {
     protocol::validate_initials(rest).then(|| rest.to_owned())
 }
 
-/// Runs attract (restarting it as needed) until a player enters initials,
-/// and returns them. Never returns an error — see the module docs.
-pub async fn acquire_initials(cfg: &Config) -> String {
+/// Recognizes the attract-mode Start handoff line.
+pub fn is_start_line(line: &str) -> bool {
+    line.trim_end_matches(['\r', '\n']) == START_LINE
+}
+
+/// What one attract lifetime should produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttractMode {
+    Attract,
+    Initials,
+}
+
+/// Runs the idle attract (restarting it as needed) until the player
+/// presses Start. Never returns an error — a cabinet with a broken attract
+/// binary shows nothing, but the supervisor stays alive and keeps
+/// retrying.
+pub async fn wait_for_start(cfg: &Config) {
     loop {
-        match run_attract_once(cfg).await {
-            Ok(Some(initials)) => {
-                info!(%initials, "attract handed off initials");
-                return initials;
+        match run_attract_once(cfg, AttractMode::Attract, None, None).await {
+            Ok(Some(_)) => {
+                info!("attract handed off: start pressed");
+                return;
             }
-            Ok(None) => {
-                warn!("attract exited without initials; restarting in 2s");
-            }
-            Err(err) => {
-                warn!("attract failed: {err:#}; restarting in 2s");
-            }
+            Ok(None) => warn!("attract exited without start; restarting in 2s"),
+            Err(err) => warn!("attract failed: {err:#}; restarting in 2s"),
         }
         tokio::time::sleep(RESTART_DELAY).await;
     }
 }
 
-/// One attract lifetime: spawn, read stdout to EOF, reap, and return the
-/// initials if a valid handoff line was seen.
-async fn run_attract_once(cfg: &Config) -> anyhow::Result<Option<String>> {
+/// Runs the post-run initials screen for a finished run and returns the
+/// entered (or auto-padded) initials. Retries a few times on failure, then
+/// falls back to [`FALLBACK_INITIALS`] so the score is never lost.
+pub async fn acquire_initials(cfg: &Config, score: i64, end_reason: &str) -> String {
+    for attempt in 1..=INITIALS_ATTEMPTS {
+        match run_attract_once(cfg, AttractMode::Initials, Some(score), Some(end_reason)).await {
+            Ok(Some(initials)) => {
+                info!(%initials, "attract handed off initials");
+                return initials;
+            }
+            Ok(None) => warn!(attempt, "initials attract exited without handoff"),
+            Err(err) => warn!(attempt, "initials attract failed: {err:#}"),
+        }
+        tokio::time::sleep(RESTART_DELAY).await;
+    }
+    warn!(
+        fallback = FALLBACK_INITIALS,
+        "initials screen unavailable; submitting fallback initials"
+    );
+    FALLBACK_INITIALS.to_owned()
+}
+
+/// One attract lifetime: spawn in `mode`, read stdout to EOF, reap, and
+/// return the handoff payload if the expected line was seen (`Some("")`
+/// for the start line).
+async fn run_attract_once(
+    cfg: &Config,
+    mode: AttractMode,
+    score: Option<i64>,
+    end_reason: Option<&str>,
+) -> anyhow::Result<Option<String>> {
     let mut cmd = Command::new(&cfg.attract_bin);
     cmd.env("ARCADE_LEADERBOARD_URL", &cfg.leaderboard_url);
+    if let AttractMode::Initials = mode {
+        cmd.env("ARCADE_MODE", "initials");
+        if let Some(score) = score {
+            cmd.env("ARCADE_SCORE", score.to_string());
+        }
+        if let Some(reason) = end_reason {
+            cmd.env("ARCADE_END_REASON", reason);
+        }
+    }
     if cfg.iwad_unverified {
         cmd.env("ARCADE_IWAD_UNVERIFIED", "1");
     }
@@ -87,19 +144,25 @@ async fn run_attract_once(cfg: &Config) -> anyhow::Result<Option<String>> {
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut lines = BufReader::new(stdout).lines();
 
-    let mut initials: Option<String> = None;
+    let mut payload: Option<String> = None;
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => match parse_initials_line(&line) {
-                Some(parsed) => {
-                    if initials.is_none() {
-                        initials = Some(parsed);
-                    } else {
-                        warn!(%line, "attract printed more than one initials line; keeping first");
+            Ok(Some(line)) => {
+                let parsed = match mode {
+                    AttractMode::Attract => is_start_line(&line).then(String::new),
+                    AttractMode::Initials => parse_initials_line(&line),
+                };
+                match parsed {
+                    Some(value) => {
+                        if payload.is_none() {
+                            payload = Some(value);
+                        } else {
+                            warn!(%line, "attract printed more than one handoff line; keeping first");
+                        }
                     }
+                    None => debug!(%line, "attract chatter"),
                 }
-                None => debug!(%line, "attract chatter"),
-            },
+            }
             Ok(None) => break, // EOF: attract closed stdout / exited
             Err(err) => {
                 warn!(%err, "error reading attract stdout");
@@ -119,7 +182,7 @@ async fn run_attract_once(cfg: &Config) -> anyhow::Result<Option<String>> {
             let _ = child.wait().await;
         }
     }
-    Ok(initials)
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -163,6 +226,21 @@ mod tests {
             "",
         ] {
             assert_eq!(parse_initials_line(bad), None, "input: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn recognizes_the_start_line() {
+        assert!(is_start_line("ARCADE_START"));
+        assert!(is_start_line("ARCADE_START\r"));
+        for bad in [
+            "ARCADE_START pressed",
+            " ARCADE_START",
+            "ARCADE_STARTED",
+            "ARCADE_INITIALS ABC",
+            "",
+        ] {
+            assert!(!is_start_line(bad), "input: {bad:?}");
         }
     }
 }

@@ -2,17 +2,23 @@
 //! (SPEC §10/§11). Thin eframe shell over the logic in `attract` (lib.rs):
 //! decodes panel keys into [`Input`]s, drives [`step`], paints the state.
 //!
-//! Handoff: on [`AttractState::Done`] prints exactly one line
-//! `ARCADE_INITIALS ABC` to stdout, flushes, exits 0. Never exits
-//! otherwise.
+//! Two modes (`ARCADE_MODE`, see lib docs): Attract prints `ARCADE_START`
+//! when the player presses Start; Initials (post-run, with `ARCADE_SCORE`
+//! and `ARCADE_END_REASON` on screen) prints `ARCADE_INITIALS ABC`. Either
+//! way: exactly one line to stdout, flushed, exit 0 — never otherwise.
+//!
+//! All layout is designed in a fixed 1280x720 logical space; the egui zoom
+//! factor is derived from the real window size every frame, so the UI
+//! scales uniformly on any screen instead of overflowing.
 
 use std::io::Write as _;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use attract::{
-    env_flag, leaderboard_url_from_env, reel_screen, spaced, spawn_fetcher, step, AttractState,
-    BoardCategory, BoardsCache, FetchResult, Input, ReelScreen, CHARSET, INITIALS_LEN,
+    env_flag, leaderboard_url_from_env, mode_from_env, reel_screen, spaced, spawn_fetcher, step,
+    AttractState, BoardCategory, BoardsCache, FetchResult, FireSim, Input, Mode, ReelScreen,
+    CHARSET, ENTRY_TIMEOUT, FIRE_H, FIRE_W, INITIALS_LEN, START_LINE,
 };
 use eframe::egui::{
     self, Align2, Color32, FontFamily, FontId, Pos2, Rect, RichText, Stroke, StrokeKind,
@@ -29,10 +35,23 @@ const OFFWHITE: Color32 = Color32::from_rgb(232, 220, 196);
 const GOLD: Color32 = Color32::from_rgb(255, 200, 60);
 const DIM: Color32 = Color32::from_rgb(138, 122, 100);
 
+/// The fixed logical design space; the zoom factor maps it to the window.
+const DESIGN: egui::Vec2 = egui::Vec2::new(1280.0, 720.0);
+
 fn main() -> eframe::Result<()> {
+    let mode = mode_from_env();
     let windowed = env_flag("ARCADE_WINDOWED");
     let unverified = env_flag("ARCADE_IWAD_UNVERIFIED");
-    let rx = spawn_fetcher(leaderboard_url_from_env());
+    let score: Option<i64> = std::env::var("ARCADE_SCORE")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let end_reason = std::env::var("ARCADE_END_REASON").unwrap_or_default();
+    // The reel is pointless without boards; the initials screen never
+    // shows them — skip the fetcher there.
+    let rx = match mode {
+        Mode::Attract => Some(spawn_fetcher(leaderboard_url_from_env())),
+        Mode::Initials => None,
+    };
 
     let viewport = if windowed {
         egui::ViewportBuilder::default()
@@ -54,7 +73,9 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
             setup_style(&cc.egui_ctx);
-            Ok(Box::new(AttractApp::new(rx, unverified)))
+            Ok(Box::new(AttractApp::new(
+                mode, rx, unverified, score, end_reason,
+            )))
         }),
     )
 }
@@ -106,27 +127,117 @@ fn setup_style(ctx: &egui::Context) {
     style.visuals.window_fill = BG;
     style.visuals.override_text_color = Some(OFFWHITE);
     style.spacing.item_spacing = egui::vec2(16.0, 12.0);
+    // Big letter-spaced display strings must never soft-wrap mid-word —
+    // layout is sized to the fixed design space instead.
+    style.wrap_mode = Some(egui::TextWrapMode::Extend);
     ctx.set_style(style);
 }
 
+/// Keeps the logical viewport pinned to [`DESIGN`]: zoom is chosen so the
+/// smaller window axis maps to the design axis, and everything drawn in
+/// design coordinates scales uniformly with the window.
+fn apply_arcade_zoom(ctx: &egui::Context) {
+    let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+    let physical = ctx.input(|i| i.screen_rect().size()) * ctx.pixels_per_point();
+    if physical.x <= 1.0 || physical.y <= 1.0 {
+        return;
+    }
+    let zoom = (physical.x / (native * DESIGN.x))
+        .min(physical.y / (native * DESIGN.y))
+        .clamp(0.25, 4.0);
+    if (ctx.zoom_factor() - zoom).abs() > 0.01 {
+        ctx.set_zoom_factor(zoom);
+    }
+}
+
+/// The DOOM fire strip along the bottom of every screen: the [`FireSim`]
+/// buffer uploaded as a nearest-filtered texture (chunky pixels intact).
+struct Fire {
+    sim: FireSim,
+    tex: Option<egui::TextureHandle>,
+    last_step: Instant,
+}
+
+impl Fire {
+    fn new() -> Self {
+        Self {
+            sim: FireSim::new(FIRE_W, FIRE_H),
+            tex: None,
+            last_step: Instant::now(),
+        }
+    }
+
+    /// Advances the sim at ~20 fps and paints it into the bottom of the
+    /// current panel. Called first in the panel closure so everything
+    /// painted afterwards stacks above the flames.
+    fn update_and_draw(&mut self, ui: &egui::Ui) {
+        if self.last_step.elapsed() >= Duration::from_millis(50) {
+            self.last_step = Instant::now();
+            self.sim.step();
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [self.sim.width(), self.sim.height()],
+                &self.sim.rgba(),
+            );
+            match &mut self.tex {
+                Some(tex) => tex.set(img, egui::TextureOptions::NEAREST),
+                None => {
+                    self.tex = Some(ui.ctx().load_texture(
+                        "doom-fire",
+                        img,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                }
+            }
+        }
+        if let Some(tex) = &self.tex {
+            let screen = ui.ctx().screen_rect();
+            let fire_h = screen.height() * 0.22;
+            let rect = Rect::from_min_max(
+                Pos2::new(screen.left(), screen.bottom() - fire_h),
+                screen.max,
+            );
+            ui.painter().image(
+                tex.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
 struct AttractApp {
+    mode: Mode,
     state: Option<AttractState>,
     cache: BoardsCache,
-    rx: Receiver<FetchResult>,
+    rx: Option<Receiver<FetchResult>>,
+    fire: Fire,
     /// Previous frame's Ctrl state, for rising-edge Confirm detection
     /// (Ctrl is a modifier in egui, not a `Key`).
     prev_ctrl: bool,
     unverified: bool,
+    score: Option<i64>,
+    end_reason: String,
 }
 
 impl AttractApp {
-    fn new(rx: Receiver<FetchResult>, unverified: bool) -> Self {
+    fn new(
+        mode: Mode,
+        rx: Option<Receiver<FetchResult>>,
+        unverified: bool,
+        score: Option<i64>,
+        end_reason: String,
+    ) -> Self {
         Self {
-            state: Some(AttractState::initial(Instant::now())),
+            mode,
+            state: Some(AttractState::initial(mode, Instant::now())),
             cache: BoardsCache::default(),
             rx,
+            fire: Fire::new(),
             prev_ctrl: false,
             unverified,
+            score,
+            end_reason,
         }
     }
 
@@ -163,7 +274,7 @@ impl AttractApp {
         inputs
     }
 
-    fn draw(&self, ctx: &egui::Context) {
+    fn draw(&mut self, ctx: &egui::Context) {
         let t = ctx.input(|i| i.time);
         let blink_on = t.fract() < 0.55; // 1 Hz
 
@@ -183,10 +294,13 @@ impl AttractApp {
                 });
         }
 
+        let state = self.state.take().expect("state present while drawing");
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(24))
             .show(ctx, |ui| {
-                match self.state.as_ref().expect("state present while drawing") {
+                // Flames first: everything painted after stacks above them.
+                self.fire.update_and_draw(ui);
+                match &state {
                     AttractState::Idle { board_idx, .. } => match reel_screen(*board_idx) {
                         ReelScreen::Board(category) => {
                             self.draw_board_screen(ui, category);
@@ -195,12 +309,27 @@ impl AttractApp {
                         ReelScreen::PressStart => draw_press_start(ui, blink_on),
                     },
                     AttractState::InitialsEntry {
-                        chars, cursor_char, ..
-                    } => draw_initials(ui, chars, *cursor_char, t),
+                        chars,
+                        cursor_char,
+                        last_input,
+                    } => {
+                        let remaining =
+                            ENTRY_TIMEOUT.saturating_sub(last_input.elapsed()).as_secs();
+                        draw_initials(
+                            ui,
+                            chars,
+                            *cursor_char,
+                            t,
+                            self.score,
+                            &self.end_reason,
+                            remaining,
+                        );
+                    }
                     // Transient: the shell exits before this can be seen.
                     AttractState::Done(_) => {}
                 }
             });
+        self.state = Some(state);
 
         if self.cache.stale {
             draw_offline_pip(ctx);
@@ -242,7 +371,6 @@ impl AttractApp {
                                 );
                                 ui.label(
                                     RichText::new(&entry.initials)
-                                        .monospace()
                                         .color(color)
                                         .size(34.0)
                                         .strong(),
@@ -272,23 +400,33 @@ impl AttractApp {
 
 impl eframe::App for AttractApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_arcade_zoom(ctx);
         let now = Instant::now();
-        while let Ok(result) = self.rx.try_recv() {
-            self.cache.apply(result, now);
+        if let Some(rx) = &self.rx {
+            while let Ok(result) = rx.try_recv() {
+                self.cache.apply(result, now);
+            }
         }
 
         let inputs = self.collect_inputs(ctx);
         let mut state = self.state.take().expect("state always present");
         for input in inputs {
-            state = step(state, Some(input), now);
+            state = step(state, Some(input), now, self.mode);
         }
-        state = step(state, None, now);
+        state = step(state, None, now, self.mode);
 
-        if let AttractState::Done(initials) = &state {
+        if let AttractState::Done(payload) = &state {
             // The handoff contract (SPEC §11): exactly one line, flushed,
             // exit 0. Nothing else in this process writes to stdout.
             let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "ARCADE_INITIALS {initials}");
+            match self.mode {
+                Mode::Attract => {
+                    let _ = writeln!(out, "{START_LINE}");
+                }
+                Mode::Initials => {
+                    let _ = writeln!(out, "ARCADE_INITIALS {payload}");
+                }
+            }
             let _ = out.flush();
             std::process::exit(0);
         }
@@ -296,8 +434,8 @@ impl eframe::App for AttractApp {
 
         self.draw(ctx);
 
-        // Keep blink/dwell/timeout timers moving.
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // Keep blink/dwell/timeout/fire timers moving.
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 
@@ -319,7 +457,7 @@ fn draw_press_start(ui: &mut egui::Ui, blink_on: bool) {
         );
         ui.add_space(30.0);
         ui.label(
-            RichText::new("3 LETTERS  ·  5 MAPS  ·  1 LIFE")
+            RichText::new("5 MAPS  ·  1 LIFE  ·  NO SAVES")
                 .color(OCHRE)
                 .size(30.0),
         );
@@ -342,20 +480,49 @@ fn draw_footer_press_start(ui: &mut egui::Ui, blink_on: bool) {
     );
 }
 
-fn draw_initials(ui: &mut egui::Ui, chars: &str, cursor_char: usize, t: f64) {
+/// Post-run initials screen: end-reason headline, the score being claimed,
+/// the three slots, and the auto-submit countdown.
+fn draw_initials(
+    ui: &mut egui::Ui,
+    chars: &str,
+    cursor_char: usize,
+    t: f64,
+    score: Option<i64>,
+    end_reason: &str,
+    remaining_secs: u64,
+) {
     let h = ui.available_height();
     // 1 Hz pulse for the active slot.
     let pulse = ((t * std::f64::consts::TAU).sin() * 0.5 + 0.5) as f32;
 
     ui.vertical_centered(|ui| {
-        ui.add_space(h * 0.10);
+        ui.add_space(h * 0.05);
+        let (headline, color) = match end_reason {
+            "death" => ("YOU DIED", BLOOD_BRIGHT),
+            "complete" => ("RUN COMPLETE", GOLD),
+            _ => ("RUN OVER", BLOOD_BRIGHT),
+        };
         ui.label(
-            RichText::new(spaced("ENTER YOUR INITIALS"))
-                .color(BLOOD_BRIGHT)
-                .size(48.0)
+            RichText::new(spaced(headline))
+                .color(color)
+                .size(64.0)
                 .strong(),
         );
-        ui.add_space(h * 0.08);
+        if let Some(score) = score {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("SCORE  {score}"))
+                    .color(OFFWHITE)
+                    .size(40.0),
+            );
+        }
+        ui.add_space(h * 0.03);
+        ui.label(
+            RichText::new(spaced("ENTER YOUR INITIALS"))
+                .color(OCHRE)
+                .size(34.0),
+        );
+        ui.add_space(h * 0.04);
 
         // Three giant slots.
         let slot = egui::vec2(150.0, 190.0);
@@ -399,7 +566,7 @@ fn draw_initials(ui: &mut egui::Ui, chars: &str, cursor_char: usize, t: f64) {
                 slot_rect.center(),
                 Align2::CENTER_CENTER,
                 ch,
-                FontId::new(120.0, FontFamily::Monospace),
+                FontId::new(120.0, FontFamily::Proportional),
                 color,
             );
 
@@ -430,11 +597,17 @@ fn draw_initials(ui: &mut egui::Ui, chars: &str, cursor_char: usize, t: f64) {
             }
         }
 
-        ui.add_space(h * 0.08);
+        ui.add_space(h * 0.05);
         ui.label(
             RichText::new("UP / DOWN — LETTER      FIRE — LOCK IN      USE — UNDO")
                 .color(OCHRE)
                 .size(26.0),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(format!("LOCKS IN {remaining_secs}S"))
+                .color(DIM)
+                .size(22.0),
         );
     });
 }

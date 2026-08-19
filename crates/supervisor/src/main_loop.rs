@@ -68,11 +68,18 @@ pub async fn run_forever(cfg: Config) {
     }
 }
 
-/// One pass of SPEC §8.1: attract, iwad guard, session, spool, kick.
+/// Placeholder passed to gzdoom's `arcade_initials` cvar: the real
+/// initials are entered AFTER the run (classic arcade order) and patched
+/// into the submission before spooling.
+const PLACEHOLDER_INITIALS: &str = "AAA";
+
+/// One pass of SPEC §8.1 (rev: post-run initials): attract until Start,
+/// iwad guard, session, initials screen, spool, kick.
 async fn iteration(cfg: Config, spool: Arc<Spool>, submitter: Submitter) -> anyhow::Result<()> {
-    // Step 2: attract until a player enters initials (step 1, the runtime
-    // dir purge, happens inside run_session immediately before spawning).
-    let initials = attract::acquire_initials(&cfg).await;
+    // Step 2: idle attract until the player presses Start (step 1, the
+    // runtime dir purge, happens inside run_session immediately before
+    // spawning).
+    attract::wait_for_start(&cfg).await;
 
     // IWAD guard: never crash-loop into gzdoom when the WAD is absent or
     // unreadable — log loudly and fall back to attract.
@@ -88,10 +95,22 @@ async fn iteration(cfg: Config, spool: Arc<Spool>, submitter: Submitter) -> anyh
 
     // Step 3: mint the session UUID.
     let session_id = uuid::Uuid::new_v4().to_string();
-    info!(session = %session_id, %initials, "starting run");
+    info!(session = %session_id, "starting run");
 
     // Steps 4–6: spawn gzdoom, pump events, decide the end reason.
-    let finished = session::run_session(&cfg, &session_id, &initials).await?;
+    let mut finished = session::run_session(&cfg, &session_id, PLACEHOLDER_INITIALS).await?;
+
+    // Step 6b: the classic arcade moment — the run is over, the score is
+    // known, NOW the player claims it with their initials. Bounded retries
+    // with an AAA fallback inside, so the score is never lost.
+    let initials = attract::acquire_initials(
+        &cfg,
+        finished.submission.run_score,
+        &finished.submission.end_reason.to_string(),
+    )
+    .await;
+    info!(session = %session_id, %initials, "initials claimed");
+    finished.submission.initials = initials;
 
     // Step 7: the spool is the source of truth — write it before anything
     // touches the network.

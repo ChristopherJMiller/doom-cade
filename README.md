@@ -1,9 +1,9 @@
 # doom-cab
 
 A single-purpose x86 machine that powers on directly into an arcade-style DOOM
-experience: attract screen → 3-letter initials → a fixed 5-map run on one life →
-score submitted to a leaderboard → back to attract. No shell, no desktop, no way
-out without a keyboard and physical access. The whole cabinet — kiosk OS, game
+experience: attract screen → a fixed 5-map run on one life → 3-letter initials
+claim the score (after the run, arcade-style) → leaderboard → back to attract.
+No shell, no desktop, no way out without a keyboard and physical access. The whole cabinet — kiosk OS, game
 supervisor, attract UI, telemetry mod, and leaderboard service — is declared in
 a NixOS flake in this repo, and the machine self-updates from it.
 
@@ -111,9 +111,10 @@ into the pristine `assets/config/gzdoom.ini` copied fresh for every run:
 | (none) | — | Run is **always on** via `cl_run 1`; no button spent on it |
 
 `Esc` is suppressed and the menu is unreachable; the attract app handles all
-out-of-game interaction. Initials entry: joystick up/down cycles `A–Z` then
-`0–9`, Button 1 confirms and advances, Button 2 backspaces, three characters
-auto-submit.
+out-of-game interaction. Initials entry appears after the run with your score
+on screen: joystick up/down cycles `A–Z` then `0–9`, Button 1 confirms and
+advances, Button 2 backspaces, three characters auto-submit; 20 s idle
+auto-submits padded with `A`.
 
 ## Scoring
 

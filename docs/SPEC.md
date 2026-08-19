@@ -7,7 +7,7 @@
 
 ## 1. Goal
 
-A single-purpose x86 desktop that powers on directly into an arcade-style DOOM experience: attract screen → 3-letter initials → a fixed 5-map run on one life → score submitted to a leaderboard → back to attract. No shell, no desktop, no way out without a keyboard and physical access. The entire machine is declared in a NixOS flake in a GitHub repo and self-updates from that repo.
+A single-purpose x86 desktop that powers on directly into an arcade-style DOOM experience: attract screen → a fixed 5-map run on one life → 3-letter initials claim the score (classic arcade order — initials come *after* the run) → score submitted to a leaderboard → back to attract. No shell, no desktop, no way out without a keyboard and physical access. The entire machine is declared in a NixOS flake in a GitHub repo and self-updates from that repo.
 
 **Non-goals:** multiplayer, save games, mod loading at runtime, a general-purpose emulator frontend, touchscreen support.
 
@@ -248,15 +248,20 @@ Single Rust binary, `tokio`. It is the only long-lived process under cage.
 ```
 loop {
   1. purge and re-seed the runtime config dir from the read-only template
-  2. spawn arcade-attract; wait for it to exit with either
-       Initials(String)  → continue
-       Timeout           → (idle; loop back to attract, which shows demo/attract reel)
+  2. spawn arcade-attract (idle reel); wait for it to print ARCADE_START
+     (the player pressed Start) and exit
   3. mint session UUID
-  4. spawn gzdoom with the arg vector (§8.2)
+  4. spawn gzdoom with the arg vector (§8.2); arcade_initials gets a
+     placeholder — real initials are entered after the run
   5. consume the event stream; maintain in-memory RunState
   6. on player_died: sleep 3s, SIGTERM gzdoom
      on run_complete: SIGTERM gzdoom
      on unexpected exit: mark end_reason='abandoned', keep partial stats
+  6b. spawn arcade-attract in initials mode (ARCADE_MODE=initials, with
+      ARCADE_SCORE/ARCADE_END_REASON); it prints ARCADE_INITIALS ABC —
+      entered, or auto-padded on its 20s timeout. Bounded retries, then
+      an AAA fallback: a finished score is never lost. Patch the
+      submission's initials.
   7. compute run_score; write to local spool DB
   8. kick the submitter task (async, non-blocking)
 }
@@ -354,7 +359,7 @@ USB encoder (Zero Delay / Xin-Mo class) configured in **keyboard mode**, so the 
 
 Menu access must be suppressed during a run — rebind or unbind `Esc` in the pristine config so a player cannot reach settings, quit, or save. The attract app handles all out-of-game interaction.
 
-Initials entry in `arcade-attract`: joystick up/down cycles the character, Button 1 confirms and advances, Button 2 backspaces, three characters then auto-submits. Classic arcade behavior; charset `A–Z` then `0–9`.
+Initials entry in `arcade-attract`, shown **after the run** with the score on screen (classic arcade order): joystick up/down cycles the character, Button 1 confirms and advances, Button 2 backspaces, three characters then auto-submits; 20 s of inactivity auto-submits what's entered, padded with `A`. Charset `A–Z` then `0–9`.
 
 ---
 
@@ -362,11 +367,10 @@ Initials entry in `arcade-attract`: joystick up/down cycles the character, Butto
 
 `arcade-attract`, egui via `eframe` (glow backend is sufficient; verify Wayland-under-cage behavior early). Fullscreen, no decorations.
 
-States:
+Two modes (`ARCADE_MODE`), each one launch of the same binary:
 
-1. **Idle reel** — cycles the five leaderboards on ~8-second dwell, interleaved with a "PRESS START" prompt. Fetches `/v1/boards` on entry and every 60s; renders cached data with a subtle offline indicator on failure.
-2. **Initials entry** — entered on Start. 20-second inactivity timeout returns to idle.
-3. **Exit** — prints the chosen initials to stdout in a machine-readable form and exits 0; supervisor reads it.
+1. **Attract mode (idle reel)** — cycles the five leaderboards on ~8-second dwell, interleaved with a "PRESS START" prompt. Fetches `/v1/boards` on entry and every 60s; renders cached data with a subtle offline indicator on failure. On Start: prints `ARCADE_START` and exits 0 — the supervisor launches the run.
+2. **Initials mode (post-run)** — launched by the supervisor after the run with `ARCADE_SCORE`/`ARCADE_END_REASON`; shows the end-reason headline ("YOU DIED" / "RUN COMPLETE"), the score, and the initials wheel. Prints `ARCADE_INITIALS ABC` and exits 0 — on the third confirm, or on the 20-second inactivity timeout with the partial entry padded (`A`), so a walked-away score still lands.
 
 Also displays the "UNVERIFIED IWAD" banner when preflight fell back to Freedoom.
 
