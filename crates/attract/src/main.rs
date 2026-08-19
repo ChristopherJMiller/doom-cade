@@ -52,10 +52,31 @@ fn main() -> eframe::Result<()> {
         "arcade-attract",
         options,
         Box::new(move |cc| {
+            setup_fonts(&cc.egui_ctx);
             setup_style(&cc.egui_ctx);
             Ok(Box::new(AttractApp::new(rx, unverified)))
         }),
     )
+}
+
+/// Loads the bundled Anta face (OFL 1.1, `assets/fonts/anta/`) as the
+/// primary proportional font — the same display face the leaderboard web
+/// view embeds, so the cabinet screen and the LAN page share one identity.
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "anta".to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "../../../assets/fonts/anta/Anta-Regular.ttf"
+        ))
+        .into(),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "anta".to_owned());
+    ctx.set_fonts(fonts);
 }
 
 fn setup_style(ctx: &egui::Context) {

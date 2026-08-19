@@ -4,8 +4,13 @@
 //! complete with JavaScript disabled; a small inline script re-fetches
 //! `/v1/boards` every 30 seconds and swaps the board rows in place,
 //! flipping the header pip to OFFLINE when the fetch fails. Everything is
-//! inline — no external fonts, stylesheets, scripts, or requests of any
-//! kind.
+//! inline — no external requests of any kind: the Anta display face
+//! (OFL 1.1, bundled at `assets/fonts/anta/`) is embedded as a base64 data
+//! URI, and the header's DOOM fire is a ~50-line inline canvas effect that
+//! degrades to a static ember glow without JS or under
+//! `prefers-reduced-motion`.
+
+use std::sync::OnceLock;
 
 use protocol::{Board, BoardCategory, BoardEntry, Season};
 
@@ -23,6 +28,49 @@ fn esc(s: &str) -> String {
         }
     }
     out
+}
+
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Minimal standard base64 encoder (encode-only, padding included) so the
+/// bundled font can become a data URI without pulling in a dependency.
+fn base64(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
+        // 1 input byte -> 2 output chars, 2 -> 3, 3 -> 4; the rest is '='.
+        let keep = chunk.len() + 1;
+        for (i, &ix) in idx.iter().enumerate() {
+            out.push(if i < keep {
+                B64_ALPHABET[ix as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// The bundled display face; the attract app loads the same file.
+static ANTA_TTF: &[u8] = include_bytes!("../../../assets/fonts/anta/Anta-Regular.ttf");
+
+/// `@font-face` rule with the font embedded as a data URI, built once.
+fn font_face_css() -> &'static str {
+    static CSS: OnceLock<String> = OnceLock::new();
+    CSS.get_or_init(|| {
+        format!(
+            "@font-face{{font-family:'Anta';\
+             src:url(data:font/ttf;base64,{}) format('truetype');\
+             font-display:swap}}",
+            base64(ANTA_TTF)
+        )
+    })
 }
 
 /// Small unit label shown in each card's header.
@@ -104,18 +152,19 @@ fn fingerprint(season: &Season) -> String {
 
 const STYLE: &str = r#"
 :root{
-  --bg:#0a0503; --panel:#140b07; --panel2:#1c0f08;
-  --red:#ff3f2f; --red-deep:#8c1c10;
-  --ochre:#c9862e; --brown:#4a2d1a;
-  --ink:#eadfc8; --dim:#93765a;
+  --void:#080404;
+  --steel-hi:#3d342a; --steel:#241d16; --steel-lo:#120d09;
+  --blood:#a10e0e; --ember:#e8481c; --fire:#ff8c1a; --flare:#ffd23e;
+  --bone:#e8dcc4; --dim:#8a7a64; --ochre:#c9862e;
   --gold:#ffb937; --silver:#b3bcc6; --bronze:#c47a3b;
   --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono","DejaVu Sans Mono",monospace;
+  --display:'Anta',var(--mono);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html{background:var(--bg)}
+html{background:var(--void)}
 body{
-  font-family:var(--mono);color:var(--ink);
-  background:radial-gradient(120% 90% at 50% 0%,#1a0c06 0%,var(--bg) 60%);
+  font-family:var(--mono);color:var(--bone);
+  background:radial-gradient(120% 90% at 50% 0%,#160a05 0%,var(--void) 60%);
   min-height:100vh;padding:1.5rem 1.25rem 2.5rem;letter-spacing:.02em;
 }
 body::before{
@@ -126,71 +175,147 @@ body::after{
   content:"";position:fixed;inset:0;z-index:40;pointer-events:none;
   background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px);
 }
+/* Header: bevelled steel marquee with the DOOM fire burning behind the title.
+   Without JS (or with reduced motion) the fire canvas stays empty and the
+   static ember gradient below carries the same read. */
 .marquee{
-  max-width:72rem;margin:0 auto 1.6rem;display:flex;align-items:baseline;
-  gap:1rem;flex-wrap:wrap;border:2px solid var(--brown);
-  border-bottom-color:var(--red-deep);
-  background:linear-gradient(180deg,#200e07,#120804);padding:1rem 1.25rem;
+  position:relative;overflow:hidden;
+  max-width:76rem;margin:0 auto 1.4rem;
+  background:
+    linear-gradient(180deg,rgba(8,4,4,0) 35%,rgba(161,14,14,.28) 78%,rgba(232,72,28,.4) 100%),
+    linear-gradient(180deg,#150c08,#0b0605);
+  box-shadow:0 0 0 2px #000,inset 2px 2px 0 0 var(--steel-hi),inset -2px -2px 0 0 #0a0705;
 }
+.fire{
+  position:absolute;left:0;right:0;bottom:0;width:100%;height:100%;
+  image-rendering:pixelated;pointer-events:none;
+}
+.mq-inner{
+  position:relative;z-index:2;display:flex;align-items:baseline;
+  gap:.4rem 1.2rem;flex-wrap:wrap;padding:1.2rem 1.5rem 1.5rem;
+}
+.eyebrow{width:100%;font-size:.6rem;letter-spacing:.45em;color:var(--dim)}
 h1{
-  font-size:clamp(1.3rem,4vw,2.1rem);letter-spacing:.35em;color:var(--red);
-  text-shadow:0 0 6px rgba(255,63,47,.9),0 0 28px rgba(255,63,47,.35);
-  font-weight:800;
+  font-family:var(--display);font-weight:400;
+  font-size:clamp(2rem,6vw,3.4rem);letter-spacing:.12em;line-height:1;
+  background:linear-gradient(180deg,var(--flare) 0%,var(--fire) 34%,var(--ember) 58%,var(--blood) 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  filter:drop-shadow(0 2px 0 #000) drop-shadow(0 0 18px rgba(255,120,26,.35));
 }
-.tag{color:var(--ochre);letter-spacing:.25em;font-size:.7rem}
+.tag{color:var(--ochre);letter-spacing:.28em;font-size:.7rem}
 .pip{
   margin-left:auto;font-size:.65rem;letter-spacing:.25em;
-  padding:.35rem .6rem;border:1px solid var(--brown);color:var(--ochre);
+  padding:.35rem .6rem;border:1px solid var(--steel-hi);color:var(--ochre);
+  background:rgba(0,0,0,.45);
 }
-.pip.offline{color:var(--red);border-color:var(--red-deep);animation:blink 1.1s steps(1) infinite}
+.pip.offline{color:var(--ember);border-color:var(--blood);animation:blink 1.1s steps(1) infinite}
+/* Boards: chunky status-bar panels — hard black outline, raised bevel,
+   recessed body well. */
 .boards{
-  max-width:72rem;margin:0 auto;display:grid;gap:1.1rem;
+  max-width:76rem;margin:0 auto;display:grid;gap:1.2rem;
   grid-template-columns:repeat(auto-fill,minmax(19.5rem,1fr));
 }
 .card{
-  border:1px solid var(--brown);
-  background:linear-gradient(180deg,var(--panel2),var(--panel));
-  box-shadow:0 0 0 1px #000,inset 0 0 40px rgba(0,0,0,.5);
+  background:linear-gradient(180deg,var(--steel),var(--steel-lo));
+  box-shadow:0 0 0 2px #000,inset 2px 2px 0 0 var(--steel-hi),inset -2px -2px 0 0 #0a0705;
 }
 .card-head{
-  display:flex;justify-content:space-between;align-items:center;
-  padding:.7rem .9rem;border-bottom:2px solid var(--red-deep);
-  background:rgba(140,28,16,.12);
+  display:flex;justify-content:space-between;align-items:baseline;
+  padding:.75rem 1rem .55rem;border-bottom:2px solid var(--blood);
+  background:linear-gradient(180deg,rgba(161,14,14,.18),rgba(161,14,14,.04));
 }
 .card-head h2{
-  font-size:.85rem;letter-spacing:.3em;color:var(--ink);
-  text-shadow:0 0 10px rgba(255,63,47,.25);
+  font-family:var(--display);font-weight:400;
+  font-size:1.05rem;letter-spacing:.2em;color:var(--bone);
+  text-shadow:0 0 12px rgba(232,72,28,.35);
 }
 .unit{font-size:.6rem;color:var(--dim);letter-spacing:.2em}
-.card-body{padding:.4rem .35rem .6rem}
+.card-body{
+  padding:.5rem .45rem .7rem;
+  box-shadow:inset 0 0 26px rgba(0,0,0,.55);
+}
 .rows{list-style:none}
 .row{
-  display:grid;grid-template-columns:2.2rem 3.9rem 1fr auto;gap:.5rem;
-  align-items:baseline;padding:.42rem .55rem;font-size:.85rem;
-  border-bottom:1px dotted rgba(74,45,26,.6);
+  display:grid;grid-template-columns:2.2rem 4.4rem 1fr auto;gap:.5rem;
+  align-items:baseline;padding:.46rem .55rem;font-size:.85rem;
+  border-bottom:1px dotted rgba(61,52,42,.7);
 }
 .row:last-child{border-bottom:none}
 .rank{color:var(--dim);font-size:.7rem}
-.ini{letter-spacing:.25em;font-weight:700}
-.val{text-align:right;color:var(--ochre);font-variant-numeric:tabular-nums}
+.ini{font-family:var(--display);letter-spacing:.28em;font-size:1rem}
+.val{
+  font-family:var(--display);text-align:right;font-size:1.05rem;
+  color:var(--fire);font-variant-numeric:tabular-nums;
+  text-shadow:1px 1px 0 #000,0 0 10px rgba(255,140,26,.3);
+}
 .sub{color:var(--dim);font-size:.65rem;letter-spacing:.08em;text-align:right;min-width:5.2rem}
-.top1 .rank,.top1 .ini,.top1 .val{color:var(--gold)}
-.top1 .ini{text-shadow:0 0 8px rgba(255,185,55,.35)}
+.top1 .rank,.top1 .ini{color:var(--gold)}
+.top1 .val{color:var(--gold);text-shadow:1px 1px 0 #000,0 0 12px rgba(255,185,55,.45)}
+.top1 .ini{text-shadow:0 0 10px rgba(255,185,55,.4)}
 .top2 .rank,.top2 .ini,.top2 .val{color:var(--silver)}
 .top3 .rank,.top3 .ini,.top3 .val{color:var(--bronze)}
 .empty{padding:2rem .5rem;text-align:center;color:var(--dim);letter-spacing:.15em;font-size:.75rem}
-.blink{color:var(--red);animation:blink 1.1s steps(1) infinite}
+.blink{color:var(--ember);animation:blink 1.1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
 .footer{
-  max-width:72rem;margin:1.75rem auto 0;display:flex;flex-wrap:wrap;
+  max-width:76rem;margin:1.75rem auto 0;display:flex;flex-wrap:wrap;
   gap:.5rem 1.5rem;justify-content:space-between;color:var(--dim);
-  font-size:.65rem;letter-spacing:.15em;border-top:1px solid var(--brown);
+  font-size:.65rem;letter-spacing:.15em;border-top:1px solid var(--steel-hi);
   padding-top:.8rem;
 }
 @media (prefers-reduced-motion:reduce){.blink,.pip.offline{animation:none}}
 "#;
 
 const SCRIPT: &str = r#"
+/* DOOM fire (the classic PSX-era cellular automaton): heat rises from a
+   permanently-hot bottom row, decaying and jittering sideways. Skipped
+   entirely under prefers-reduced-motion; the static ember gradient in the
+   marquee remains. */
+(function () {
+  var cv = document.getElementById('fire');
+  if (!cv || !cv.getContext) return;
+  if (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var W = 240, H = 64;
+  cv.width = W; cv.height = H;
+  var ctx = cv.getContext('2d');
+  // 37-step heat ramp: void -> blood -> ember -> fire -> flare -> white.
+  var stops = [
+    [7, 7, 7], [31, 7, 7], [71, 15, 7], [103, 31, 7], [143, 39, 7],
+    [175, 63, 7], [199, 71, 7], [223, 87, 7], [215, 103, 15], [207, 127, 15],
+    [199, 151, 31], [191, 175, 47], [223, 207, 111], [255, 255, 255]
+  ];
+  var pal = [];
+  for (var i = 0; i < 37; i++) {
+    var t = i / 36 * (stops.length - 1);
+    var a = Math.floor(t), b = Math.min(a + 1, stops.length - 1), f = t - a;
+    pal.push([0, 1, 2].map(function (k) {
+      return Math.round(stops[a][k] + (stops[b][k] - stops[a][k]) * f);
+    }));
+  }
+  var heat = new Uint8Array(W * H);
+  for (var x = 0; x < W; x++) heat[(H - 1) * W + x] = 36;
+  var img = ctx.createImageData(W, H);
+  function frame() {
+    for (var y = 1; y < H; y++) {
+      for (var x2 = 0; x2 < W; x2++) {
+        var src = y * W + x2;
+        var r = (Math.random() * 3) | 0;
+        var dst = src - W - r + 1;
+        if (dst < 0) dst = 0;
+        var h = heat[src] - (r & 1);
+        heat[dst] = h > 0 ? h : 0;
+      }
+    }
+    var d = img.data;
+    for (var p = 0; p < W * H; p++) {
+      var c = pal[heat[p]], o = p * 4;
+      d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2];
+      d[o + 3] = heat[p] === 0 ? 0 : 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+  setInterval(frame, 50);
+})();
 (function () {
   var pip = document.getElementById('pip');
   function subline(cat, e) {
@@ -262,17 +387,23 @@ pub fn render(season: &Season, boards: &[Board]) -> String {
     }
     let fp = fingerprint(season);
 
-    let mut page = String::with_capacity(16 * 1024);
+    let mut page = String::with_capacity(160 * 1024);
     page.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     page.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
     page.push_str("<title>DOOM ARCADE &mdash; LEADERBOARD</title>");
     page.push_str("<style>");
+    page.push_str(font_face_css());
     page.push_str(STYLE);
     page.push_str("</style></head><body>");
     page.push_str(
-        "<header class=\"marquee\"><h1>DOOM ARCADE</h1>\
+        "<header class=\"marquee\">\
+         <canvas id=\"fire\" class=\"fire\" aria-hidden=\"true\"></canvas>\
+         <div class=\"mq-inner\">\
+         <span class=\"eyebrow\">CABINET LEADERBOARD</span>\
+         <h1>DOOM ARCADE</h1>\
          <span class=\"tag\">ONE LIFE &middot; FIVE MAPS</span>\
-         <span class=\"pip\" id=\"pip\">LIVE</span></header>",
+         <span class=\"pip\" id=\"pip\">LIVE</span>\
+         </div></header>",
     );
     page.push_str("<main class=\"boards\">");
     page.push_str(&cards);
@@ -326,5 +457,41 @@ mod tests {
             map_rotation_id: "rot-v1".to_owned(),
         };
         assert!(fingerprint(&empty).starts_with("NO-IWAD"));
+    }
+
+    #[test]
+    fn base64_known_vectors() {
+        // RFC 4648 test vectors (padding in every phase).
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn page_embeds_font_and_fire_canvas() {
+        let season = Season {
+            iwad_sha256: String::new(),
+            scoring_version: 1,
+            map_rotation_id: "rot-v1".to_owned(),
+        };
+        let page = render(&season, &[]);
+        assert!(page.contains("@font-face"), "font-face missing");
+        assert!(
+            page.contains("data:font/ttf;base64,"),
+            "font not embedded as data URI"
+        );
+        assert!(page.contains("id=\"fire\""), "fire canvas missing");
+        // The embedded font makes the page big but bounded: TTF is ~74 KiB,
+        // so base64 lands near 100 KiB. Keep a ceiling so a future font swap
+        // that balloons the page gets noticed.
+        assert!(
+            page.len() < 300 * 1024,
+            "page unexpectedly huge: {}",
+            page.len()
+        );
     }
 }
