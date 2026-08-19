@@ -24,11 +24,16 @@ Caveats for the supervisor:
 - stdout capture (the SPEC's fallback) also carries the same text on Linux,
   but is block-buffered when redirected to a file — under SIGKILL the tail
   is lost. Preferred transport = the FIFO, as the SPEC hoped.
-- `Console.Printf` uses the default print level, which also paints the line
-  into the on-screen notify area. If that proves ugly on the cabinet,
-  `Console.PrintfEx(PRINT_LOG, ...)` exists on 4.14.2 (`engine/base.zs:678`)
-  as a candidate — but whether PRINT_LOG output reaches the logfile/stdout
-  identically has NOT been tested; switch only with a re-test.
+- ~~`Console.Printf` uses the default print level, which also paints the
+  line into the on-screen notify area.~~ **Resolved 2026-08-18**: once the
+  2 s progress heartbeat existed, plain Printf kept the top of the screen
+  permanently covered in raw JSON (and buried the HUD overlay), so `Emit`
+  now uses `Console.PrintfEx(PRINT_LOG, ...)` (`engine/base.zs:678`,
+  `PRINT_LOG` = "only to logfile", `base.zs:141`). Re-tested live as §13.1
+  demanded: an otherwise-identical scripted run captured the identical
+  set of telemetry lines through the FIFO (19/19, all parseable), and
+  screenshots show a clean notify area. PRINT_LOG output does reach the
+  `+logfile` FIFO exactly like the default level did.
 
 ## §13.2 — exact ZScript API names on 4.14.2
 
@@ -82,6 +87,145 @@ refuses to advance off MAP08 ("no next map!") because its next is an end
 sequence, not a map — only real exits (exit lines/switches,
 `Exit_Normal`) follow it. Fine for production, mildly annoying for manual
 testing.
+
+## Partial credit: `progress` heartbeat + hold-Start-to-quit (added 2026-08-18)
+
+Both features live-verified on the same harness (Xvfb + llvmpipe + Freedoom
+Phase 2 + FIFO logfile), with **real X11 Enter key events** injected via
+xdotool/XTEST against the Xvfb display — so the full production path
+(hardware-ish key event → `InputProcess` → net event → `WorldTick` counter →
+emission) ran end to end, using a copy of the production
+`assets/config/gzdoom.ini` (in which Enter is genuinely unbound: the
+`[Doom.Bindings]` section replaces GZDoom's defaults wholesale).
+
+### Architecture note: ui/play fence
+
+`InputProcess` is **ui scope** (`virtual ui bool InputProcess(InputEvent e)`,
+gzdoom.pk3 `zscript/events.zs:194`) and ui code cannot write play-side
+fields. Key state therefore crosses the fence via
+`EventHandler.SendNetworkEvent("arcade_start_down"/"arcade_start_up")`
+(clearscope static) into `NetworkProcess` (play scope), which sets the
+`startHeld` flag consumed by `WorldTick`. `InputEvent.Key_Enter == 0x1c`
+confirmed in gzdoom.pk3 `zscript/engine/inputevents.zs:106` *and* live (an
+XTEST Enter keydown/keyup drove the whole chain). `InputProcess` returns
+false unconditionally — it observes, never consumes.
+
+### What was verified live
+
+- **Heartbeat cadence**: `progress` lines arrived every 2.00 s on the dot
+  (`maptime_tics` 70, 140, 210, …), with correct MAP01 totals (18/3/32 —
+  same numbers the level_complete tests produced) and sane `px`/`py`.
+- **px/py track the player**: idle heartbeats repeated `px:-192,py:-192`;
+  after holding +forward for 2 s the next heartbeats read `px:-53` then
+  `px:687` — movement is visible to walk-away detection.
+- **First-tic suppression**: no heartbeat at map entry (`maptime > 0` and
+  modulo-70 gate); first one fires at tic 70.
+- **Hold-to-quit timing**: warning appeared exactly 1.0 s after keydown;
+  `run_quit` was emitted 2.98–3.00 s after keydown in both full-hold runs
+  (`maptime_tics` = keydown-tic + 105 exactly). Emitted **once** — holding
+  a further 2 s produced no duplicate (`runQuitEmitted` latch).
+- **Release resets**: a 1.75 s hold (warning shown) then release produced
+  no `run_quit`, and a subsequent full hold quit 3.0 s from its *own*
+  keydown (had the counter not reset it would have fired at ~1.4 s).
+- **On-screen warning**: red centered "KEEP HOLDING TO END RUN"
+  (`Console.MidPrint(smallfont, ...)`) visible in screenshots while held;
+  the empty-`MidPrint` sent on release blanks it immediately (verified in
+  a screenshot 0.4 s after keyup) instead of lingering for `con_midtime`.
+- **Parser round-trip**: every captured sentinel line (13 progress, 1
+  run_quit, plus run_start/level_enter) fed through the real
+  `protocol::parse_event_line` via a scratch Rust binary — 15/15 parsed
+  into the expected variants, 0 sentinel lines rejected.
+
+Sample lines (verbatim from the FIFO):
+
+```
+ARCADE_EVT {"v":1,"event":"progress","session":"holdquit-test-uuid","map":"MAP01","kills":0,"total_monsters":18,"secrets":0,"total_secrets":3,"items":0,"total_items":32,"maptime_tics":350,"px":74,"py":-192}
+ARCADE_EVT {"v":1,"event":"run_quit","session":"holdquit-test-uuid","map":"MAP01","maptime_tics":755}
+```
+
+### Findings and known behaviour
+
+- **MidPrint echoes into the logfile** (text between dashed separator
+  lines) on every call. Re-arming it per tic flooded the telemetry FIFO
+  with ~210 junk lines/s while Start was held (observed live), so the
+  handler re-arms it only once per second of hold. The supervisor already
+  ignores non-sentinel lines; this is about noise, not correctness.
+- **Intermissions**: `WorldTick` does not run during intermission screens,
+  so holding Start there does nothing — the hold counter neither advances
+  nor fires. Known, accepted behaviour: quitting is only possible mid-map.
+  `WorldLoaded` additionally resets the hold state on every fresh map
+  entry, so a hold spanning an intermission must be released and
+  re-pressed on the next map.
+- **Menus**: `InputProcess` is bypassed while a menu is open, so releasing
+  Start inside a menu is invisible (stale `startHeld` latch). The game is
+  paused in single-player menus (no `WorldTick`, counter frozen); after
+  closing the menu the player just releases and re-presses. Moot on the
+  cabinet, where the menu is unreachable.
+- **Heartbeats continue after `run_quit`** until the supervisor's SIGTERM
+  lands (observed: two more progress lines in ~1 s). The supervisor should
+  act on `run_quit` and ignore the stragglers.
+- **`netevent` can forge the hold events** (`IsManual` is deliberately not
+  filtered): it grants exactly the power of holding the Start button and
+  the cabinet exposes no console; filtering it would only have cost the
+  headless test seam.
+- **Stock configs bind `Enter=invuse`** (GZDoom default). Irrelevant twice
+  over: the cabinet config unbinds it, and `InputProcess` sees every raw
+  key event before bindings anyway (verified with Enter unbound; the
+  handler never consumes, so a binding would still fire too — `invuse` is
+  a no-op in Doom with no inventory).
+- **Null-pawn guard**: no `progress` is emitted when
+  `players[consoleplayer].mo` is null (px/py are the event's purpose);
+  hold-to-quit and heartbeats are both gated on `runStarted && !playerDead`.
+- **Harness tip**: GL-rendered frames read back **black** through
+  `xwd`/XGetImage; add `+set vid_rendermode 0` (software renderer) when a
+  test needs screenshots. Key injection needs the gzdoom window focused
+  (`xdotool windowfocus`) and the pointer parked over it (no WM on Xvfb).
+
+## Walk-up HUD overlay (added 2026-08-18)
+
+`RenderOverlay` (ui scope) draws top-right at virtual 1280x800
+(`DTA_VirtualWidth/Height` + `DTA_KeepRatio`, `NewSmallFont`): gold live
+score, "MAP n/5 · <name>" (rotation position via a case-insensitive match
+against the fixed map list; non-rotation maps show just their name), a
+gray controls crib that collapses after 525 tics (15 s) of map time, and a
+permanent "HOLD START — END RUN + BANK SCORE" line. The score is
+`bankedScore` (accumulated play-side in WorldUnloaded — **keep in sync
+with crates/protocol/src/scoring.rs**, constants mirrored as class consts)
+plus the open map's provisional kills/secrets/items points read off
+LevelLocals each frame. Display-only; supervisor/server recomputation
+stays authoritative.
+
+Verified live (scripted run: startup command buffer `+wait 750; kill
+monsters; wait 350; special Exit_Normal 0` with sv_cheats — no console
+toggling needed, so the game never pauses; screenshots via
+`vid_rendermode 0` + xwd):
+
+- Full overlay early on MAP01 (`SCORE 0`, `MAP 1/5 · Hydroelectric
+  Plant`, controls block, hold-Start line), correctly right-aligned.
+- Controls block gone after 15 s; hold-Start line slides up. Reappears on
+  MAP02 entry (per-map, keyed off `level.maptime`).
+- `kill monsters` (18 kills) → overlay reads `SCORE 180` (18×10) within a
+  couple of seconds — live Level-counter mirroring works.
+- After `Exit_Normal` into MAP02 the overlay read **`SCORE 2018`**, which
+  is exactly `map_score(MAP01) + depth`: 18 kills×10 + 500 completion +
+  (600 − 1100/35 s)×2 = 1138 time bonus + 200 depth, computed from the
+  same run's `level_complete` line — banked math matches
+  crates/protocol/src/scoring.rs to the point.
+- Centered MidPrint quit warning and the overlay coexist (screenshot).
+- **Zero render-path lines on the FIFO** across ~30k rendered frames
+  (capture contained only telemetry, engine chatter, and the throttled
+  MidPrint echoes). RenderOverlay must never Console.Printf.
+- Non-ASCII glyphs "·" and "—" render fine in NewSmallFont.
+
+ZScript gotchas hit (both verified by compile error, then fixed):
+
+- A class-scope `static const` array is **not visible as an identifier**
+  from method bodies on 4.14.2 ("Unknown identifier"); declare such
+  arrays inside the functions that use them (gzdoom.pk3's own ui code
+  does the same).
+- Methods of a `play`-scope class default to play scope: a helper called
+  from `RenderOverlay` must be marked `clearscope` (or `ui`) or it fails
+  with "Can't call play function from ui context".
 
 ## Live-run event log (verbatim from the FIFO)
 
