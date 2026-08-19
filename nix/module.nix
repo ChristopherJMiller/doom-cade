@@ -114,6 +114,18 @@ in
       description = "Run windowed 1280x720 (sets ARCADE_DEV=1 for the supervisor).";
     };
 
+    publicUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Visitor-facing leaderboard URL shown on the attract screen
+        (ARCADE_PUBLIC_URL). When null, the attract app derives one itself:
+        a non-loopback leaderboard.url verbatim, else the machine's LAN IP
+        swapped into it. Set explicitly when neither is right (e.g. the VM
+        shows the host-forwarded port).
+      '';
+    };
+
     leaderboard = {
       enable = lib.mkEnableOption "running the leaderboard service locally on this machine";
 
@@ -149,10 +161,28 @@ in
         default = false;
         description = "Open the leaderboard port in the firewall.";
       };
+
+      generateToken = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Generate a random POST bearer token at
+          /var/lib/doom-arcade/api-token on first boot (persisted) and use
+          it as leaderboard.tokenFile. Both the local leaderboard and the
+          supervisor run on this machine, so a locally minted secret needs
+          no external secret management; GET (browsing the boards) stays
+          open, POST (score submission) requires the token.
+        '';
+      };
     };
   };
 
   config = lib.mkIf cfg.enable {
+    # generateToken supplies the token file unless the host pinned one.
+    services.doom-arcade.leaderboard.tokenFile = lib.mkIf cfg.leaderboard.generateToken (
+      lib.mkDefault "/var/lib/doom-arcade/api-token"
+    );
+
     assertions =
       let
         listenHost = lib.head (lib.splitString ":" cfg.leaderboard.listen);
@@ -203,6 +233,32 @@ in
       "d /run/doom-arcade 0755 doom doom -"
     ];
 
+    # Mints the POST bearer token once; /var/lib/doom-arcade is persisted,
+    # so the token (and thus spooled-run submission) survives reboots.
+    systemd.services.doom-arcade-token = lib.mkIf cfg.leaderboard.generateToken {
+      description = "DOOM arcade leaderboard token generation";
+      before = [
+        "cage-tty1.service"
+        "arcade-leaderboard.service"
+      ];
+      requiredBy = [ "cage-tty1.service" ] ++ lib.optional cfg.leaderboard.enable "arcade-leaderboard.service";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        token=/var/lib/doom-arcade/api-token
+        if [ ! -s "$token" ]; then
+          umask 077
+          ${pkgs.coreutils}/bin/head -c 32 /dev/urandom | ${pkgs.coreutils}/bin/base64 -w0 > "$token.new"
+          mv "$token.new" "$token"
+          echo "minted new leaderboard API token at $token"
+        fi
+        chown doom:doom "$token"
+        chmod 0400 "$token"
+      '';
+    };
+
     # Verifies the IWAD before the kiosk starts and publishes the result as
     # an environment file consumed by cage-tty1.
     systemd.services.doom-arcade-preflight = {
@@ -231,6 +287,7 @@ in
     // lib.optionalAttrs (cfg.leaderboard.tokenFile != null) {
       ARCADE_TOKEN_FILE = toString cfg.leaderboard.tokenFile;
     }
+    // lib.optionalAttrs (cfg.publicUrl != null) { ARCADE_PUBLIC_URL = cfg.publicUrl; }
     // lib.optionalAttrs cfg.dev { ARCADE_DEV = "1"; };
 
     # Dynamic (preflight-computed) environment: ARCADE_IWAD,
