@@ -117,6 +117,48 @@ pub enum Event {
         /// Total time across all maps, in tics.
         total_maptime_tics: i64,
     },
+    /// Periodic in-map heartbeat (~every 2 seconds from `WorldTick`),
+    /// carrying provisional stats so a run that ends without a clean
+    /// map-exit event (walk-away, deliberate quit, engine death) still
+    /// gets credit for the map in progress. Also powers walk-away
+    /// detection: the supervisor watches `px`/`py` and the counters for
+    /// movement.
+    Progress {
+        /// Session UUID.
+        session: String,
+        /// Map lump name, e.g. `"MAP03"`.
+        map: String,
+        /// Kills so far on this map.
+        kills: i64,
+        /// Total monsters on this map.
+        total_monsters: i64,
+        /// Secrets found so far on this map.
+        secrets: i64,
+        /// Total secrets on this map.
+        total_secrets: i64,
+        /// Items picked up so far on this map.
+        items: i64,
+        /// Total items on this map.
+        total_items: i64,
+        /// Time on this map so far, in tics.
+        maptime_tics: i64,
+        /// Player X position, whole map units (idle detection only).
+        px: i64,
+        /// Player Y position, whole map units (idle detection only).
+        py: i64,
+    },
+    /// Emitted when the player deliberately ends the run early (holding
+    /// Start for ~3 seconds). The run is scored with whatever the
+    /// heartbeats last reported for the map in progress; no completion or
+    /// time bonus for it (SPEC §5).
+    RunQuit {
+        /// Session UUID.
+        session: String,
+        /// Map the run was quit on.
+        map: String,
+        /// Time on that map at the moment of quitting, in tics.
+        maptime_tics: i64,
+    },
 }
 
 /// Parses one log line into an [`Event`], returning `None` for anything
@@ -227,6 +269,24 @@ mod tests {
             Event::RunComplete {
                 session: "s".into(),
                 total_maptime_tics: 31_500,
+            },
+            Event::Progress {
+                session: "s".into(),
+                map: "MAP03".into(),
+                kills: 7,
+                total_monsters: 44,
+                secrets: 0,
+                total_secrets: 3,
+                items: 12,
+                total_items: 30,
+                maptime_tics: 2100,
+                px: -512,
+                py: 1024,
+            },
+            Event::RunQuit {
+                session: "s".into(),
+                map: "MAP03".into(),
+                maptime_tics: 2170,
             },
         ]
     }

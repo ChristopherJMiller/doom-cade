@@ -24,19 +24,23 @@ pub enum EndReason {
     Death,
     /// The final map of the rotation was cleared.
     Complete,
-    /// The engine exited unexpectedly or the watchdog fired; partial
-    /// stats were kept.
+    /// The engine exited unexpectedly, the walk-away detector fired, or
+    /// the watchdog fired; partial stats were kept.
     Abandoned,
+    /// The player deliberately ended the run early (held Start); partial
+    /// stats were kept and the score counts.
+    Quit,
 }
 
 impl EndReason {
-    /// The canonical lowercase string form: `"death"`, `"complete"`, or
-    /// `"abandoned"`.
+    /// The canonical lowercase string form: `"death"`, `"complete"`,
+    /// `"abandoned"`, or `"quit"`.
     pub fn as_str(self) -> &'static str {
         match self {
             EndReason::Death => "death",
             EndReason::Complete => "complete",
             EndReason::Abandoned => "abandoned",
+            EndReason::Quit => "quit",
         }
     }
 }
@@ -48,9 +52,9 @@ impl fmt::Display for EndReason {
 }
 
 /// Error returned by [`EndReason::from_str`] for anything other than the
-/// exact strings `"death"`, `"complete"`, or `"abandoned"`.
+/// exact strings `"death"`, `"complete"`, `"abandoned"`, or `"quit"`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid end reason {0:?} (expected \"death\", \"complete\", or \"abandoned\")")]
+#[error("invalid end reason {0:?} (expected \"death\", \"complete\", \"abandoned\", or \"quit\")")]
 pub struct ParseEndReasonError(pub String);
 
 impl FromStr for EndReason {
@@ -61,6 +65,7 @@ impl FromStr for EndReason {
             "death" => Ok(EndReason::Death),
             "complete" => Ok(EndReason::Complete),
             "abandoned" => Ok(EndReason::Abandoned),
+            "quit" => Ok(EndReason::Quit),
             other => Err(ParseEndReasonError(other.to_owned())),
         }
     }
@@ -194,12 +199,18 @@ mod tests {
 
     #[test]
     fn end_reason_display_and_from_str_round_trip() {
-        for reason in [EndReason::Death, EndReason::Complete, EndReason::Abandoned] {
+        for reason in [
+            EndReason::Death,
+            EndReason::Complete,
+            EndReason::Abandoned,
+            EndReason::Quit,
+        ] {
             assert_eq!(reason.to_string().parse::<EndReason>(), Ok(reason));
         }
         assert_eq!("death".parse(), Ok(EndReason::Death));
         assert_eq!("complete".parse(), Ok(EndReason::Complete));
         assert_eq!("abandoned".parse(), Ok(EndReason::Abandoned));
+        assert_eq!("quit".parse(), Ok(EndReason::Quit));
     }
 
     #[test]
@@ -210,7 +221,8 @@ mod tests {
             "DEATH",
             "death ",
             " death",
-            "quit",
+            "Quit",
+            "quit ",
             "complete\n",
         ] {
             assert!(bad.parse::<EndReason>().is_err(), "input: {bad:?}");
