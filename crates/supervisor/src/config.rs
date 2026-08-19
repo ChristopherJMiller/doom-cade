@@ -90,6 +90,10 @@ pub struct Config {
     /// this long, the run is abandoned. Longer than the ~2 s heartbeat
     /// cadence by design — intermissions pause heartbeats.
     pub stall_timeout: Duration,
+    /// Explicit visitor-facing leaderboard URL, passed through to attract
+    /// as `ARCADE_PUBLIC_URL` for the idle-screen display. When unset,
+    /// attract derives one itself (LAN IP swapped into a loopback URL).
+    pub public_url: Option<String>,
     /// Dev mode: gzdoom gets `-width 1280 -height 720 +vid_fullscreen 0`,
     /// attract gets `ARCADE_WINDOWED=1`.
     pub dev: bool,
@@ -127,6 +131,7 @@ impl Config {
                 .unwrap_or_else(|| UNKNOWN_IWAD_SHA256.to_owned()),
             idle_timeout: parse_secs(get("ARCADE_IDLE_TIMEOUT"), DEFAULT_IDLE_TIMEOUT_SECS),
             stall_timeout: parse_secs(get("ARCADE_STALL_TIMEOUT"), DEFAULT_STALL_TIMEOUT_SECS),
+            public_url: get("ARCADE_PUBLIC_URL"),
             dev: parse_bool(get("ARCADE_DEV")),
         }
     }

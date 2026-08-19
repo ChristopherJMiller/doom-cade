@@ -363,6 +363,75 @@ pub fn spawn_fetcher(base_url: String) -> Receiver<FetchResult> {
     rx
 }
 
+/// Extracts the host portion of a plain `http://host[:port][/path]` URL.
+/// Deliberately minimal (no IPv6-bracket or userinfo support — LAN http
+/// URLs only); returns `None` when the shape is unrecognizable.
+pub fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("http://")
+        .or(url.strip_prefix("https://"))?;
+    let end = rest.find([':', '/']).unwrap_or(rest.len());
+    let host = &rest[..end];
+    (!host.is_empty()).then_some(host)
+}
+
+/// True when the URL's host is loopback — an address useless to a visitor
+/// standing at the cabinet with a phone.
+pub fn is_loopback_url(url: &str) -> bool {
+    matches!(url_host(url), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
+/// Replaces the host in a plain http URL, keeping scheme, port, and path.
+pub fn swap_host(url: &str, new_host: &str) -> Option<String> {
+    let host = url_host(url)?;
+    let scheme_len = url.find("://")? + 3;
+    let host_start = scheme_len;
+    let host_end = host_start + host.len();
+    Some(format!(
+        "{}{}{}",
+        &url[..host_start],
+        new_host,
+        &url[host_end..]
+    ))
+}
+
+/// Best-effort primary LAN IP: the classic UDP "connect" trick — no packet
+/// is sent; the OS just picks the source address it would route from.
+/// `None` when there is no route (offline cabinet).
+pub fn detect_lan_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+/// The URL visitors should use for the leaderboard, shown on the idle
+/// screen. Resolution order:
+///
+/// 1. `ARCADE_PUBLIC_URL` set → shown verbatim (the VM sets this to the
+///    host-forwarded port; a cabinet fronted by an external leaderboard
+///    could too).
+/// 2. `ARCADE_LEADERBOARD_URL` already non-loopback → that IS the public
+///    URL (off-cabinet leaderboard).
+/// 3. Loopback leaderboard → swap the detected LAN IP into it (the
+///    cabinet serves the same port on the LAN).
+/// 4. No route / nothing detectable → `None` (show nothing rather than a
+///    lie).
+pub fn public_board_url() -> Option<String> {
+    if let Ok(explicit) = std::env::var("ARCADE_PUBLIC_URL") {
+        let explicit = explicit.trim().to_owned();
+        if !explicit.is_empty() {
+            return Some(explicit);
+        }
+    }
+    let board_url = leaderboard_url_from_env();
+    if !is_loopback_url(&board_url) {
+        return Some(board_url);
+    }
+    let ip = detect_lan_ip()?;
+    swap_host(&board_url, &ip.to_string())
+}
+
 /// Inserts a space between every character for the chunky letter-spaced
 /// arcade look; existing word gaps widen to three spaces.
 ///
@@ -817,6 +886,39 @@ mod tests {
         assert!(!flag_is_set(Some("true")));
         assert!(!flag_is_set(Some("")));
         assert!(!flag_is_set(None));
+    }
+
+    #[test]
+    fn url_host_and_loopback_detection() {
+        assert_eq!(url_host("http://127.0.0.1:8080"), Some("127.0.0.1"));
+        assert_eq!(url_host("http://10.20.30.41:8080/v1"), Some("10.20.30.41"));
+        assert_eq!(
+            url_host("https://boards.corp.example"),
+            Some("boards.corp.example")
+        );
+        assert_eq!(url_host("ftp://x"), None);
+        assert_eq!(url_host("http://"), None);
+        assert!(is_loopback_url("http://127.0.0.1:8080"));
+        assert!(is_loopback_url("http://localhost:8080"));
+        assert!(!is_loopback_url("http://10.0.0.5:8080"));
+        assert!(!is_loopback_url("http://boards.corp.example"));
+    }
+
+    #[test]
+    fn swap_host_keeps_scheme_port_and_path() {
+        assert_eq!(
+            swap_host("http://127.0.0.1:8080", "10.20.30.41").as_deref(),
+            Some("http://10.20.30.41:8080")
+        );
+        assert_eq!(
+            swap_host("http://localhost:8080/v1/boards", "192.168.1.7").as_deref(),
+            Some("http://192.168.1.7:8080/v1/boards")
+        );
+        assert_eq!(
+            swap_host("http://127.0.0.1", "10.0.0.2").as_deref(),
+            Some("http://10.0.0.2")
+        );
+        assert_eq!(swap_host("nonsense", "10.0.0.2"), None);
     }
 
     #[test]

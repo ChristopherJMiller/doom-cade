@@ -119,6 +119,9 @@ async fn run_attract_once(
 ) -> anyhow::Result<Option<String>> {
     let mut cmd = Command::new(&cfg.attract_bin);
     cmd.env("ARCADE_LEADERBOARD_URL", &cfg.leaderboard_url);
+    if let Some(public_url) = &cfg.public_url {
+        cmd.env("ARCADE_PUBLIC_URL", public_url);
+    }
     if let AttractMode::Initials = mode {
         cmd.env("ARCADE_MODE", "initials");
         if let Some(score) = score {

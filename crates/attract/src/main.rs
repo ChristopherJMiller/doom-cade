@@ -218,6 +218,10 @@ struct AttractApp {
     unverified: bool,
     score: Option<i64>,
     end_reason: String,
+    /// URL visitors use for the leaderboard, shown top-right on the idle
+    /// reel. Re-derived every 60 s so DHCP lease changes track.
+    public_url: Option<String>,
+    public_url_at: Instant,
 }
 
 impl AttractApp {
@@ -238,6 +242,8 @@ impl AttractApp {
             unverified,
             score,
             end_reason,
+            public_url: attract::public_board_url(),
+            public_url_at: Instant::now(),
         }
     }
 
@@ -334,6 +340,13 @@ impl AttractApp {
         if self.cache.stale {
             draw_offline_pip(ctx);
         }
+        // Board URL for visitors, idle reel only (the initials screen
+        // stays focused on the claim).
+        if matches!(self.state, Some(AttractState::Idle { .. })) {
+            if let Some(url) = &self.public_url {
+                draw_public_url(ctx, url, self.unverified);
+            }
+        }
     }
 
     fn draw_board_screen(&self, ui: &mut egui::Ui, category: BoardCategory) {
@@ -406,6 +419,13 @@ impl eframe::App for AttractApp {
             while let Ok(result) = rx.try_recv() {
                 self.cache.apply(result, now);
             }
+        }
+        // Track DHCP changes; cheap (no I/O beyond a route lookup).
+        if self.mode == Mode::Attract
+            && now.duration_since(self.public_url_at) >= Duration::from_secs(60)
+        {
+            self.public_url = attract::public_board_url();
+            self.public_url_at = now;
         }
 
         let inputs = self.collect_inputs(ctx);
@@ -611,6 +631,32 @@ fn draw_initials(
                 .size(22.0),
         );
     });
+}
+
+/// Board URL for visitors' phones/laptops, top-right of the idle reel
+/// ("SCOREBOARD · http://10.20.30.41:8080"). Sits below the UNVERIFIED
+/// banner when that is shown.
+fn draw_public_url(ctx: &egui::Context, url: &str, unverified: bool) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("public-url"),
+    ));
+    let screen = ctx.screen_rect();
+    let y = screen.top() + if unverified { 72.0 } else { 16.0 };
+    let text_rect = painter.text(
+        Pos2::new(screen.right() - 20.0, y),
+        Align2::RIGHT_TOP,
+        url,
+        FontId::new(22.0, FontFamily::Monospace),
+        OCHRE,
+    );
+    painter.text(
+        Pos2::new(text_rect.left() - 12.0, text_rect.center().y),
+        Align2::RIGHT_CENTER,
+        "SCOREBOARD",
+        FontId::new(18.0, FontFamily::Proportional),
+        DIM,
+    );
 }
 
 /// Small OFFLINE pip in the bottom-right corner when the last boards fetch
